@@ -5,7 +5,9 @@ from typing import Any, Callable, Optional
 
 import torch
 
-from vllm.distributed import get_tensor_model_parallel_rank, get_tp_group
+from vllm.distributed import (get_tensor_model_parallel_rank,
+                              get_tensor_model_parallel_world_size,
+                              get_tp_group)
 from vllm.model_executor.layers.fused_moe.layer import (
     FusedMoE, FusedMoEConfig, FusedMoEMethodBase, FusedMoeWeightScaleSupported)
 from vllm.model_executor.layers.linear import (LinearBase,
@@ -405,13 +407,24 @@ class MoeWNA16Method(FusedMoEMethodBase):
                                     shard_id: str,
                                     expert_id: int,
                                     return_success: bool = False):
+            # This loader is designed for loading weights from a single file.
+            # So, we need to handle TP here.
+            tp_rank = get_tensor_model_parallel_rank()
+            tp_size = get_tensor_model_parallel_world_size()
+
+            # This expert is not managed by this rank, skip it.
+            if expert_id % tp_size != tp_rank:
+                return True if return_success else None
+
+            # Calculate the local expert ID.
+            local_expert_id = expert_id // tp_size
+
             if "g_idx" in weight_name:
                 return False if return_success else None
             if not layer.quant_config.has_zp and "qzeros" in weight_name:
                 return False if return_success else None
 
             device = get_tp_group().device
-            tp_rank = get_tensor_model_parallel_rank()
             loaded_weight = loaded_weight.to(device)
             shard_size = layer.intermediate_size_per_partition
 
@@ -443,21 +456,21 @@ class MoeWNA16Method(FusedMoEMethodBase):
 
             # repeat the qzeros/scales to fit new group size
             if layer.group_size_div_factor > 1 and \
-                    "qzeros" in weight_name or "scales" in weight_name:
+                    ("qzeros" in weight_name or "scales" in weight_name):
                 loaded_weight = loaded_weight.repeat_interleave(
                     layer.group_size_div_factor, 1)
 
             if "w13_qzeros" in weight_name:
-                tensor = loaded_weight.view(layer.tp_size, -1,
+                tensor = loaded_weight.view(tp_size, -1,
                                             loaded_weight.size(1))[tp_rank]
                 if shard_id == "w1":
-                    param.data[expert_id, :shard_size // 2] = tensor
+                    param.data[local_expert_id, :shard_size // 2] = tensor
                 else:
-                    param.data[expert_id, shard_size // 2:] = tensor
+                    param.data[local_expert_id, shard_size // 2:] = tensor
                 return True if return_success else None
             elif "w2_qzeros" in weight_name:
-                param.data[expert_id] = loaded_weight.view(
-                    loaded_weight.size(0), layer.tp_size, -1)[:, tp_rank]
+                param.data[local_expert_id] = loaded_weight.view(
+                    loaded_weight.size(0), tp_size, -1)[:, tp_rank]
                 return True if return_success else None
             else:
                 # Delegate to the original loader, passing return_success
@@ -465,7 +478,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
                                      loaded_weight,
                                      weight_name,
                                      shard_id,
-                                     expert_id,
+                                     local_expert_id,
                                      return_success=return_success)
 
         return moe_wna16_weight_loader
