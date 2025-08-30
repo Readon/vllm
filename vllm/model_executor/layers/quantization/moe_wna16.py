@@ -456,13 +456,13 @@ class MoeWNA16Method(FusedMoEMethodBase):
 
             # repeat the qzeros/scales to fit new group size
             if layer.group_size_div_factor > 1 and \
-                    ("qzeros" in weight_name or "scales" in weight_name):
+                    "qzeros" in weight_name or "scales" in weight_name:
                 loaded_weight = loaded_weight.repeat_interleave(
                     layer.group_size_div_factor, 1)
 
             if "w13_qzeros" in weight_name:
-                tensor = loaded_weight.view(tp_size, -1,
-                                            loaded_weight.size(1))[tp_rank]
+                tensor = loaded_weight.view(loaded_weight.size(0), tp_size,
+                                            -1)[:, tp_rank]
                 if shard_id == "w1":
                     param.data[local_expert_id, :shard_size // 2] = tensor
                 else:
@@ -470,7 +470,7 @@ class MoeWNA16Method(FusedMoEMethodBase):
                 return True if return_success else None
             elif "w2_qzeros" in weight_name:
                 param.data[local_expert_id] = loaded_weight.view(
-                    loaded_weight.size(0), tp_size, -1)[:, tp_rank]
+                    tp_size, -1, loaded_weight.size(1))[tp_rank]
                 return True if return_success else None
             else:
                 # Delegate to the original loader, passing return_success
