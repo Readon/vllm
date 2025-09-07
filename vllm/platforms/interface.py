@@ -42,6 +42,7 @@ class _Backend(enum.Enum):
     FLASH_ATTN = enum.auto()
     FLASH_ATTN_VLLM_V1 = enum.auto()
     TRITON_ATTN_VLLM_V1 = enum.auto()
+    TURING = enum.auto()
     XFORMERS = enum.auto()
     ROCM_FLASH = enum.auto()
     ROCM_AITER_MLA = enum.auto()  # Supported by V1

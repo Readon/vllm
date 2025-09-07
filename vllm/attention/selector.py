@@ -202,6 +202,15 @@ def _cached_get_attn_backend(
                     f"Valid backends are: {list(_Backend.__members__.keys())}")
 
     # get device-specific attn_backend
+    # Special case for Turing (CC 7.5)
+    if current_platform.is_device_capability((7, 5)):
+        turing_backend_cls = "vllm.attention.backends.turing_attn.TuringAttentionBackend"
+        if is_attn_backend_supported(turing_backend_cls, head_size, dtype):
+            logger.info("Using Turing-optimized Triton backend.")
+            return resolve_obj_by_qualname(turing_backend_cls)
+        else:
+            logger.info("Turing backend not supported for head size %d and dtype %s. Falling back.", head_size, dtype)
+
     attention_cls = current_platform.get_attn_backend_cls(
         selected_backend, head_size, dtype, kv_cache_dtype, block_size, use_v1,
         use_mla, has_sink)
