@@ -323,30 +323,24 @@ class TuringAttentionImpl(AttentionImpl[TuringAttentionMetadata]):
                 # The Turing kernel returns [num_tokens, num_heads * head_size], reshape to [num_tokens, num_heads, head_size]
                 output[:num_prefill_tokens] = out.view(num_prefill_tokens, self.num_heads, self.head_size)
             else:
-                # Fallback for prefix caching
-                logger.warning_once("TuringAttentionBackend using PagedAttention for prefix caching.")
-
+                # Use the new prefix-aware Triton kernel for chunked prefill
                 prefill_query = query[:num_prefill_tokens]
                 prefill_key = key[:num_prefill_tokens] if key is not None else None
                 prefill_value = value[:num_prefill_tokens] if value is not None else None
 
-                out = PagedAttention.forward_prefix(
+                out = _prefix_attention(
                     prefill_query,
                     prefill_key,
                     prefill_value,
-                    self.kv_cache_dtype,
                     key_cache,
                     value_cache,
                     prefill_meta.block_tables,
                     prefill_meta.query_start_loc,
                     prefill_meta.seq_lens_tensor,
-                    prefill_meta.max_prefill_seq_len,
-                    None,  # alibi_slopes
-                    self.sliding_window,
-                    k_scale,
-                    v_scale,
+                    prefill_meta.max_query_len,
+                    self.scale,
+                    self.num_kv_heads,
                 )
-                # PagedAttention returns [num_tokens, num_heads, head_size], which is what output buffer expects
                 output[:num_prefill_tokens] = out
 
         # Decode phase - always use PagedAttention for decode as it's optimized for single-token generation
@@ -421,6 +415,144 @@ def _run_turing_flash_attention_forward(
     )
 
     return output.view(num_tokens, num_heads * head_size)
+
+
+@triton.jit
+def _prefix_fwd_kernel(
+    Q, K, V, K_cache, V_cache, block_tables,
+    sm_scale, B_Start_Loc, B_Seqlen, Out,
+    stride_qbs, stride_qh, stride_qd,
+    stride_kbs, stride_kh, stride_kd,
+    stride_vbs, stride_vh, stride_vd,
+    stride_obs, stride_oh, stride_od,
+    stride_block_tables_b, stride_block_tables_s,
+    stride_k_cache_b, stride_k_cache_h, stride_k_cache_d, stride_k_cache_bl, stride_k_cache_x,
+    stride_v_cache_b, stride_v_cache_h, stride_v_cache_d, stride_v_cache_bl,
+    num_queries_per_kv: tl.constexpr, x: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
+    BLOCK_N: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+):
+    cur_batch = tl.program_id(0)
+    cur_head = tl.program_id(1)
+    start_m = tl.program_id(2)
+
+    cur_kv_head = cur_head // num_queries_per_kv
+
+    cur_batch_seq_len = tl.load(B_Seqlen + cur_batch)
+    cur_batch_in_all_start_index = tl.load(B_Start_Loc + cur_batch)
+    cur_batch_in_all_stop_index = tl.load(B_Start_Loc + cur_batch + 1)
+    cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
+    cur_batch_ctx_len = cur_batch_seq_len - cur_batch_query_len
+
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = tl.arange(0, BLOCK_N)
+    offs_d = tl.arange(0, BLOCK_DMODEL)
+    off_q = (cur_batch_in_all_start_index + offs_m[:, None]) * stride_qbs + cur_head * stride_qh + offs_d[None, :] * stride_qd
+    q = tl.load(Q + off_q, mask=offs_m[:, None] < cur_batch_query_len, other=0.0)
+
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
+    acc = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
+
+    # Attention with KV Cache
+    offs_bs_n = tl.arange(0, BLOCK_SIZE)
+    for start_n in range(0, cur_batch_ctx_len, BLOCK_SIZE):
+        start_n = tl.multiple_of(start_n, BLOCK_SIZE)
+        bn = tl.load(block_tables + cur_batch * stride_block_tables_b + (start_n // BLOCK_SIZE) * stride_block_tables_s)
+        off_k = (bn[None, :] * stride_k_cache_b + cur_kv_head * stride_k_cache_h +
+                 (offs_d[:, None] // x) * stride_k_cache_d +
+                 ((start_n + offs_bs_n[None, :]) % BLOCK_SIZE) * stride_k_cache_bl +
+                 (offs_d[:, None] % x) * stride_k_cache_x)
+        off_v = (bn[:, None] * stride_v_cache_b + cur_kv_head * stride_v_cache_h +
+                 offs_d[None, :] * stride_v_cache_d +
+                 offs_bs_n[:, None] * stride_v_cache_bl)
+
+        k = tl.load(K_cache + off_k, mask=(start_n + offs_bs_n[None, :]) < cur_batch_ctx_len, other=0.0)
+        qk = tl.dot(q, k)
+        qk *= sm_scale
+        qk = tl.where((start_n + offs_bs_n[None, :]) < cur_batch_ctx_len, qk, float("-inf"))
+
+        m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+        p = tl.exp(qk - m_ij[:, None])
+        l_ij = tl.sum(p, axis=1)
+        alpha = tl.exp(m_i - m_ij)
+        acc = acc * alpha[:, None]
+
+        v = tl.load(V_cache + off_v, mask=(start_n + offs_bs_n[:, None]) < cur_batch_ctx_len, other=0.0)
+        p = p.to(v.dtype)
+        acc = tl.dot(p, v, acc)
+
+        l_i = l_i * alpha + l_ij
+        m_i = m_ij
+
+    # Self-attention for the new tokens
+    for start_n in range(0, (start_m + 1) * BLOCK_M, BLOCK_N):
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        off_k = (cur_batch_in_all_start_index + start_n + offs_n[None, :]) * stride_kbs + cur_kv_head * stride_kh + offs_d[:, None] * stride_kd
+        off_v = (cur_batch_in_all_start_index + start_n + offs_n[:, None]) * stride_vbs + cur_kv_head * stride_vh + offs_d[None, :] * stride_vd
+
+        k = tl.load(K + off_k, mask=(start_n + offs_n[None, :]) < cur_batch_query_len, other=0.0)
+        qk = tl.dot(q, k)
+        qk *= sm_scale
+        qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk, float("-inf"))
+
+        m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
+        p = tl.exp(qk - m_ij[:, None])
+        l_ij = tl.sum(p, axis=1)
+        alpha = tl.exp(m_i - m_ij)
+        acc = acc * alpha[:, None]
+
+        v = tl.load(V + off_v, mask=(start_n + offs_n[None, :]) < cur_batch_query_len, other=0.0)
+        p = p.to(v.dtype)
+        acc = tl.dot(p, v, acc)
+
+        l_i = l_i * alpha + l_ij
+        m_i = m_ij
+
+    acc = acc / l_i[:, None]
+    off_o = (cur_batch_in_all_start_index + offs_m[:, None]) * stride_obs + cur_head * stride_oh + offs_d[None, :] * stride_od
+    tl.store(Out + off_o, acc, mask=offs_m[:, None] < cur_batch_query_len)
+
+
+def _prefix_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    seq_lens_tensor: torch.Tensor,
+    max_query_len: int,
+    sm_scale: float,
+    num_kv_heads: int,
+) -> torch.Tensor:
+    output = torch.empty_like(query)
+    batch_size = block_tables.shape[0]
+    num_heads = query.shape[1]
+    head_size = query.shape[2]
+
+    BLOCK_M = 128
+    BLOCK_N = 64
+    grid = (batch_size, num_heads, triton.cdiv(max_query_len, BLOCK_M))
+
+    x = 16 // key_cache.element_size()
+
+    _prefix_fwd_kernel[grid](
+        query, key, value, key_cache, value_cache, block_tables,
+        sm_scale, query_start_loc, seq_lens_tensor, output,
+        query.stride(0), query.stride(1), query.stride(2),
+        key.stride(0), key.stride(1), key.stride(2),
+        value.stride(0), value.stride(1), value.stride(2),
+        output.stride(0), output.stride(1), output.stride(2),
+        block_tables.stride(0), block_tables.stride(1),
+        key_cache.stride(0), key_cache.stride(1), key_cache.stride(2), key_cache.stride(3), key_cache.stride(4),
+        value_cache.stride(0), value_cache.stride(1), value_cache.stride(2), value_cache.stride(3),
+        num_queries_per_kv=num_heads // num_kv_heads, x=x,
+        BLOCK_M=BLOCK_M, BLOCK_DMODEL=head_size, BLOCK_N=BLOCK_N,
+        BLOCK_SIZE=value_cache.shape[3]
+    )
+    return output
 
 
 turing_autotune_configs = [
