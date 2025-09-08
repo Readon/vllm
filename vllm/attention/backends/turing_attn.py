@@ -12,6 +12,7 @@ a custom Triton kernel. The **decode phase** reuses the existing, highly-optimiz
 PagedAttention CUDA kernel from vLLM, as this is typically faster for single-
 token decoding than a generic Triton implementation.
 """
+import itertools
 import os
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Type
@@ -383,21 +384,13 @@ def _run_turing_flash_attention_forward(
 ) -> torch.Tensor:
     """
     Wrapper to call the Triton kernel for the prefill phase.
-
-    Args:
-        query: [num_tokens, num_heads, head_size]
-        key: [num_tokens, num_kv_heads, head_size]
-        value: [num_tokens, num_kv_heads, head_size]
+    This version avoids manual padding and uses cumulative sequence lengths.
     """
-    if attn_metadata.seq_lens is None or len(attn_metadata.seq_lens) == 0:
+    if attn_metadata.seq_lens is None or not attn_metadata.seq_lens:
         raise ValueError("seq_lens is required for Turing attention")
 
-    batch_size = len(attn_metadata.seq_lens)
-    seq_lens = attn_metadata.seq_lens
-    max_seq_len = max(seq_lens)
-
     # Input tensors are already in [num_tokens, num_heads, head_size] format
-    _, _, head_size = query.shape
+    num_tokens, _, head_size = query.shape
     _, num_kv_heads, _ = key.shape
 
     # Handle GQA/MQA by repeating KV heads if needed
@@ -409,52 +402,35 @@ def _run_turing_flash_attention_forward(
     if head_size not in [16, 32, 64, 128]:
         raise ValueError(f"Head size {head_size} not supported by Turing backend. Supported sizes: [16, 32, 64, 128]")
 
-    # Create padded tensors for batch processing
-    q_padded = torch.zeros(batch_size, max_seq_len, num_heads, head_size,
-                          dtype=query.dtype, device=query.device)
-    k_padded = torch.zeros(batch_size, max_seq_len, num_heads, head_size,
-                          dtype=key.dtype, device=key.device)
-    v_padded = torch.zeros(batch_size, max_seq_len, num_heads, head_size,
-                          dtype=value.dtype, device=value.device)
+    # Create cumulative sequence lengths tensor
+    cu_seqlens = torch.tensor(
+        list(itertools.accumulate([0] + attn_metadata.seq_lens)),
+        device=query.device,
+        dtype=torch.int32
+    )
 
-    # Fill padded tensors
-    start_idx = 0
-    for i, seq_len in enumerate(seq_lens):
-        end_idx = start_idx + seq_len
-        # Tensors are already in the correct shape [seq_len, num_heads, head_size]
-        q_padded[i, :seq_len] = query[start_idx:end_idx]
-        k_padded[i, :seq_len] = key[start_idx:end_idx]
-        v_padded[i, :seq_len] = value[start_idx:end_idx]
-        start_idx = end_idx
-
-    # Transpose to [batch_size, num_heads, seq_len, head_size]
-    q_padded = q_padded.transpose(1, 2)
-    k_padded = k_padded.transpose(1, 2)
-    v_padded = v_padded.transpose(1, 2)
-
-    # Run attention kernel
     is_causal = True
-    output_padded = _turing_attention_kernel(q_padded, k_padded, v_padded, is_causal, scale)
+    output = _turing_attention_kernel(
+        query,
+        key,
+        value,
+        cu_seqlens,
+        attn_metadata.max_prefill_seq_len,
+        is_causal,
+        scale
+    )
 
-    # Unpad and reshape output back to [num_tokens, num_heads * head_size]
-    output_padded = output_padded.transpose(1, 2)  # [batch_size, seq_len, num_heads, head_size]
-    output_list = []
-    for i, seq_len in enumerate(seq_lens):
-        out_seq = output_padded[i, :seq_len]  # [seq_len, num_heads, head_size]
-        # Reshape to [seq_len, num_heads * head_size] to match expected output format
-        out_seq = out_seq.reshape(seq_len, num_heads * head_size)
-        output_list.append(out_seq)
-
-    return torch.cat(output_list, dim=0)  # [num_tokens, num_heads * head_size]
+    return output.view(num_tokens, num_heads * head_size)
 
 
 @triton.jit
 def _turing_attention_kernel_forward(
     Q, K, V, Out,
-    q_stride_z, q_stride_h, q_stride_m, q_stride_k,
-    k_stride_z, k_stride_h, k_stride_n, k_stride_k,
-    v_stride_z, v_stride_h, v_stride_n, v_stride_k,
-    out_stride_z, out_stride_h, out_stride_m, out_stride_k,
+    cu_seqlens_q,
+    stride_qz, stride_qh, stride_qm, stride_qk,
+    stride_kz, stride_kh, stride_kn, stride_kk,
+    stride_vz, stride_vh, stride_vn, stride_vk,
+    stride_oz, stride_oh, stride_om, stride_ok,
     Z, H, N_CTX,
     SCALE: tl.constexpr,
     D_HEAD: tl.constexpr,
@@ -466,23 +442,46 @@ def _turing_attention_kernel_forward(
     off_z = tl.program_id(1)
     off_h = tl.program_id(2)
 
-    # Bounds checking for batch and head dimensions
-    if off_z >= Z or off_h >= H:
+    cu_seqlens_q_start = tl.load(cu_seqlens_q + off_z)
+    cu_seqlens_q_end = tl.load(cu_seqlens_q + off_z + 1)
+    seqlen_q = cu_seqlens_q_end - cu_seqlens_q_start
+
+    if start_m * BLOCK_M >= seqlen_q:
         return
 
-    # Check if we're within sequence bounds
-    if start_m * BLOCK_M >= N_CTX:
-        return
+    q_offset = off_h * stride_qh + cu_seqlens_q_start * stride_qm
+    k_offset = off_h * stride_kh + cu_seqlens_q_start * stride_kn
+    v_offset = off_h * stride_vh + cu_seqlens_q_start * stride_vn
+    out_offset = off_h * stride_oh + cu_seqlens_q_start * stride_om
 
-    q_offset = off_z * q_stride_z + off_h * q_stride_h
-    k_offset = off_z * k_stride_z + off_h * k_stride_h
-    v_offset = off_z * v_stride_z + off_h * v_stride_h
-    out_offset = off_z * out_stride_z + off_h * out_stride_h
-
-    Q_block_ptr = tl.make_block_ptr(base=Q + q_offset, shape=(N_CTX, D_HEAD), strides=(q_stride_m, q_stride_k), offsets=(start_m * BLOCK_M, 0), block_shape=(BLOCK_M, D_HEAD), order=(1, 0))
-    K_block_ptr = tl.make_block_ptr(base=K + k_offset, shape=(D_HEAD, N_CTX), strides=(k_stride_k, k_stride_n), offsets=(0, 0), block_shape=(D_HEAD, BLOCK_N), order=(0, 1))
-    V_block_ptr = tl.make_block_ptr(base=V + v_offset, shape=(N_CTX, D_HEAD), strides=(v_stride_n, v_stride_k), offsets=(0, 0), block_shape=(BLOCK_N, D_HEAD), order=(1, 0))
-    Out_block_ptr = tl.make_block_ptr(base=Out + out_offset, shape=(N_CTX, D_HEAD), strides=(out_stride_m, out_stride_k), offsets=(start_m * BLOCK_M, 0), block_shape=(BLOCK_M, D_HEAD), order=(1, 0))
+    Q_block_ptr = tl.make_block_ptr(
+        base=Q + q_offset, shape=(seqlen_q, D_HEAD),
+        strides=(stride_qm, stride_qk),
+        offsets=(start_m * BLOCK_M, 0),
+        block_shape=(BLOCK_M, D_HEAD),
+        order=(1, 0)
+    )
+    K_block_ptr = tl.make_block_ptr(
+        base=K + k_offset, shape=(D_HEAD, seqlen_q),
+        strides=(stride_kk, stride_kn),
+        offsets=(0, 0),
+        block_shape=(D_HEAD, BLOCK_N),
+        order=(0, 1)
+    )
+    V_block_ptr = tl.make_block_ptr(
+        base=V + v_offset, shape=(seqlen_q, D_HEAD),
+        strides=(stride_vn, stride_vk),
+        offsets=(0, 0),
+        block_shape=(BLOCK_N, D_HEAD),
+        order=(1, 0)
+    )
+    Out_block_ptr = tl.make_block_ptr(
+        base=Out + out_offset, shape=(seqlen_q, D_HEAD),
+        strides=(stride_om, stride_ok),
+        offsets=(start_m * BLOCK_M, 0),
+        block_shape=(BLOCK_M, D_HEAD),
+        order=(1, 0)
+    )
 
     acc = tl.zeros([BLOCK_M, D_HEAD], dtype=tl.float32)
     m_i = tl.full([BLOCK_M, 1], value=float('-inf'), dtype=tl.float32)
@@ -491,8 +490,7 @@ def _turing_attention_kernel_forward(
     q = tl.load(Q_block_ptr, boundary_check=(0, 1))
     q = (q * SCALE).to(Q.dtype.element_ty)
 
-    # For causal attention, only process up to the current position
-    loop_end = N_CTX if not IS_CAUSAL else min(N_CTX, (start_m + 1) * BLOCK_M)
+    loop_end = seqlen_q if not IS_CAUSAL else (start_m + 1) * BLOCK_M
     for start_n in range(0, loop_end, BLOCK_N):
         k = tl.load(K_block_ptr, boundary_check=(0, 1))
         v = tl.load(V_block_ptr, boundary_check=(0, 1))
@@ -502,9 +500,6 @@ def _turing_attention_kernel_forward(
         if IS_CAUSAL:
             offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
             offs_n = start_n + tl.arange(0, BLOCK_N)
-            # Ensure we don't go out of bounds
-            offs_m = tl.where(offs_m < N_CTX, offs_m, N_CTX - 1)
-            offs_n = tl.where(offs_n < N_CTX, offs_n, N_CTX - 1)
             causal_mask = offs_m[:, None] >= offs_n[None, :]
             s_ij = tl.where(causal_mask, s_ij, float('-inf'))
 
@@ -527,27 +522,41 @@ def _turing_attention_kernel_forward(
     tl.store(Out_block_ptr, out.to(Out.dtype.element_ty), boundary_check=(0, 1))
 
 
-def _turing_attention_kernel(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, is_causal: bool, scale: float) -> torch.Tensor:
-    shape = q.shape
-    Z, H, N_CTX, D_HEAD = shape
-
+def _turing_attention_kernel(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    max_seq_len: int,
+    is_causal: bool,
+    scale: float,
+) -> torch.Tensor:
+    total_tokens, num_heads, head_size = q.shape
+    batch_size = len(cu_seqlens) - 1
     o = torch.empty_like(q)
 
-    # Use smaller block sizes for Turing architecture to fit in shared memory
     BLOCK_M = 64
     BLOCK_N = 32
 
-    grid = (triton.cdiv(N_CTX, BLOCK_M), Z, H)
+    grid = (triton.cdiv(max_seq_len, BLOCK_M), batch_size, num_heads)
+
+    # Strides for 3D tensors, interpreted as 4D by the kernel
+    stride_qz, stride_qh, stride_qm, stride_qk = 0, q.stride(1), q.stride(0), q.stride(2)
+    stride_kz, stride_kh, stride_kn, stride_kk = 0, k.stride(1), k.stride(0), k.stride(2)
+    stride_vz, stride_vh, stride_vn, stride_vk = 0, v.stride(1), v.stride(0), v.stride(2)
+    stride_oz, stride_oh, stride_om, stride_ok = 0, o.stride(1), o.stride(0), o.stride(2)
+
 
     _turing_attention_kernel_forward[grid](
         q, k, v, o,
-        q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-        k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-        v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-        o.stride(0), o.stride(1), o.stride(2), o.stride(3),
-        Z, H, N_CTX,
+        cu_seqlens,
+        stride_qz, stride_qh, stride_qm, stride_qk,
+        stride_kz, stride_kh, stride_kn, stride_kk,
+        stride_vz, stride_vh, stride_vn, stride_vk,
+        stride_oz, stride_oh, stride_om, stride_ok,
+        batch_size, num_heads, max_seq_len,
         SCALE=scale,
-        D_HEAD=D_HEAD,
+        D_HEAD=head_size,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         IS_CAUSAL=is_causal,
