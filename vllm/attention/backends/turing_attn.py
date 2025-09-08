@@ -661,7 +661,7 @@ def _turing_attention_kernel_forward(
 
     acc = tl.zeros([BLOCK_M, D_HEAD], dtype=tl.float32)
     m_i = tl.full([BLOCK_M, 1], value=float('-inf'), dtype=tl.float32)
-    l_i = tl.full([BLOCK_M, 1], dtype=tl.float32)
+    l_i = tl.full([BLOCK_M, 1], 1.0, dtype=tl.float32)
 
     q = tl.load(Q_block_ptr, boundary_check=(0, 1))
 
