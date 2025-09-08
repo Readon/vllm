@@ -479,13 +479,12 @@ def _prefix_fwd_kernel(
 
         qk = tl.zeros([BLOCK_M, BLOCK_SIZE], dtype=tl.float32)
         qk = tl.dot(q, k, acc=qk)
-        qk *= sm_scale
         qk = tl.where((start_n + offs_bs_n[None, :]) < cur_batch_ctx_len, qk, float("-inf"))
 
-        m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-        p = tl.exp(qk - m_ij[:, None])
+        m_ij = tl.maximum(m_i, tl.max(qk * sm_scale, axis=1))
+        p = tl.math.exp2(qk * sm_scale - m_ij[:, None])
         l_ij = tl.sum(p, axis=1)
-        alpha = tl.exp(m_i - m_ij)
+        alpha = tl.math.exp2(m_i - m_ij)
         acc = acc * alpha[:, None]
 
         v_loaded = tl.load(V_cache + off_v, mask=(start_n + offs_bs_n[:, None]) < cur_batch_ctx_len, other=0.0)
@@ -508,13 +507,13 @@ def _prefix_fwd_kernel(
         k = tl.load(K + off_k, mask=(start_n + offs_n[None, :]) < cur_batch_query_len, other=0.0)
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk = tl.dot(q, k, acc=qk)
-        qk *= sm_scale
+
         qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk, float("-inf"))
 
-        m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-        p = tl.exp(qk - m_ij[:, None])
+        m_ij = tl.maximum(m_i, tl.max(qk * sm_scale, axis=1))
+        p = tl.math.exp2(qk * sm_scale - m_ij[:, None])
         l_ij = tl.sum(p, axis=1)
-        alpha = tl.exp(m_i - m_ij)
+        alpha = tl.math.exp2(m_i - m_ij)
         acc = acc * alpha[:, None]
 
         v = tl.load(V + off_v, mask=(start_n + offs_n[:, None]) < cur_batch_query_len, other=0.0)
@@ -558,6 +557,9 @@ def _prefix_attention(
     x = 16 // key_cache.element_size()
 
     dequantize = "int8" in kv_cache_dtype or "fp8" in kv_cache_dtype
+
+    # Use exp2 for better stability
+    sm_scale = sm_scale * 1.44269504
 
     _prefix_fwd_kernel[grid](
         query, key, value, key_cache, value_cache, block_tables,
@@ -660,8 +662,8 @@ def _turing_attention_kernel_forward(
     )
 
     acc = tl.zeros([BLOCK_M, D_HEAD], dtype=tl.float32)
-    m_i = tl.full([BLOCK_M, 1], value=float('-inf'), dtype=tl.float32)
-    l_i = tl.full([BLOCK_M, 1], 1.0, dtype=tl.float32)
+    m_i = tl.full([BLOCK_M], float("-inf"), dtype=tl.float32)
+    l_i = tl.full([BLOCK_M], 1.0, dtype=tl.float32)
 
     q = tl.load(Q_block_ptr, boundary_check=(0, 1))
 
@@ -670,21 +672,20 @@ def _turing_attention_kernel_forward(
         k = tl.load(K_block_ptr, boundary_check=(0, 1))
         v = tl.load(V_block_ptr, boundary_check=(0, 1))
 
-        s_ij = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        s_ij = tl.dot(q, k, acc=s_ij)
-        s_ij *= SCALE
+        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        qk = tl.dot(q, k, acc=qk)
 
         if IS_CAUSAL:
             offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
             offs_n = start_n + tl.arange(0, BLOCK_N)
             causal_mask = offs_m[:, None] >= offs_n[None, :]
-            s_ij = tl.where(causal_mask, s_ij, float('-inf'))
+            qk = tl.where(causal_mask, qk, float("-inf"))
 
-        m_ij = tl.maximum(m_i, tl.max(s_ij, axis=1))
-        p = tl.exp(s_ij - m_ij[:, None])
+        m_ij = tl.maximum(m_i, tl.max(qk * SCALE, axis=1))
+        p = tl.math.exp2(qk * SCALE - m_ij[:, None])
         l_ij = tl.sum(p, axis=1)
 
-        alpha = tl.exp(m_i - m_ij)
+        alpha = tl.math.exp2(m_i - m_ij)
         acc = acc * alpha[:, None]
 
         p = p.to(v.dtype)
@@ -722,6 +723,8 @@ def _turing_attention_kernel(
     stride_vz, stride_vh, stride_vn, stride_vk = 0, v.stride(1), v.stride(0), v.stride(2)
     stride_oz, stride_oh, stride_om, stride_ok = 0, o.stride(1), o.stride(0), o.stride(2)
 
+    # Use exp2 for better stability
+    scale = scale * 1.44269504
 
     _turing_attention_kernel_forward[grid](
         q, k, v, o,
