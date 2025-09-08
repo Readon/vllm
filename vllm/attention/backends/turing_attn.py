@@ -515,7 +515,7 @@ def _prefix_fwd_kernel(
         alpha = tl.exp(m_i - m_ij)
         acc = acc * alpha[:, None]
 
-        v = tl.load(V + off_v, mask=(start_n + offs_n[None, :]) < cur_batch_query_len, other=0.0)
+        v = tl.load(V + off_v, mask=(start_n + offs_n[:, None]) < cur_batch_query_len, other=0.0)
         p = p.to(v.dtype)
         acc = tl.dot(p, v, acc)
 
