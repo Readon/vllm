@@ -661,17 +661,18 @@ def _turing_attention_kernel_forward(
 
     acc = tl.zeros([BLOCK_M, D_HEAD], dtype=tl.float32)
     m_i = tl.full([BLOCK_M, 1], value=float('-inf'), dtype=tl.float32)
-    l_i = tl.zeros([BLOCK_M, 1], dtype=tl.float32)
+    l_i = tl.full([BLOCK_M, 1], dtype=tl.float32)
 
     q = tl.load(Q_block_ptr, boundary_check=(0, 1))
-    q = (q * SCALE).to(Q.dtype.element_ty)
 
     loop_end = seqlen_q if not IS_CAUSAL else (start_m + 1) * BLOCK_M
     for start_n in range(0, loop_end, BLOCK_N):
         k = tl.load(K_block_ptr, boundary_check=(0, 1))
         v = tl.load(V_block_ptr, boundary_check=(0, 1))
 
-        s_ij = tl.dot(q, k, out_dtype=tl.float32)
+        s_ij = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        s_ij = tl.dot(q, k, acc=s_ij)
+        s_ij *= SCALE
 
         if IS_CAUSAL:
             offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -679,22 +680,24 @@ def _turing_attention_kernel_forward(
             causal_mask = offs_m[:, None] >= offs_n[None, :]
             s_ij = tl.where(causal_mask, s_ij, float('-inf'))
 
-        m_ij = tl.max(s_ij, 1)[:, None]
-        m_i_new = tl.maximum(m_i, m_ij)
-        exp_diff = tl.exp(m_i - m_i_new)
-        acc = acc * exp_diff
-        l_i = l_i * exp_diff
-        p_ij = tl.exp(s_ij - m_i_new)
-        l_i += tl.sum(p_ij, 1)[:, None]
-        p_ij = p_ij.to(V.dtype.element_ty)
-        acc += tl.dot(p_ij, v)
-        m_i = m_i_new
+        m_ij = tl.maximum(m_i, tl.max(s_ij, axis=1))
+        p = tl.exp(s_ij - m_ij[:, None])
+        l_ij = tl.sum(p, axis=1)
+
+        alpha = tl.exp(m_i - m_ij)
+        acc = acc * alpha[:, None]
+
+        p = p.to(v.dtype)
+        acc += tl.dot(p, v)
+
+        l_i = l_i * alpha + l_ij
+        m_i = m_ij
 
         K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_N))
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_N, 0))
 
     l_i_safe = tl.where(l_i == 0, 1.0, l_i)
-    out = acc / l_i_safe
+    out = acc / l_i_safe[:, None]
     tl.store(Out_block_ptr, out.to(Out.dtype.element_ty), boundary_check=(0, 1))
 
 
