@@ -340,6 +340,9 @@ class TuringAttentionImpl(AttentionImpl[TuringAttentionMetadata]):
                     prefill_meta.max_query_len,
                     self.scale,
                     self.num_kv_heads,
+                    self.kv_cache_dtype,
+                    k_scale,
+                    v_scale,
                 )
                 output[:num_prefill_tokens] = out
 
@@ -420,7 +423,7 @@ def _run_turing_flash_attention_forward(
 @triton.jit
 def _prefix_fwd_kernel(
     Q, K, V, K_cache, V_cache, block_tables,
-    sm_scale, B_Start_Loc, B_Seqlen, Out,
+    k_scale, v_scale, sm_scale, B_Start_Loc, B_Seqlen, Out,
     stride_qbs, stride_qh, stride_qd,
     stride_kbs, stride_kh, stride_kd,
     stride_vbs, stride_vh, stride_vd,
@@ -431,6 +434,7 @@ def _prefix_fwd_kernel(
     num_queries_per_kv: tl.constexpr, x: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr, BLOCK_SIZE: tl.constexpr,
+    DEQUANTIZE: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
@@ -467,7 +471,12 @@ def _prefix_fwd_kernel(
                  offs_d[None, :] * stride_v_cache_d +
                  offs_bs_n[:, None] * stride_v_cache_bl)
 
-        k = tl.load(K_cache + off_k, mask=(start_n + offs_bs_n[None, :]) < cur_batch_ctx_len, other=0.0)
+        k_loaded = tl.load(K_cache + off_k, mask=(start_n + offs_bs_n[None, :]) < cur_batch_ctx_len, other=0.0)
+        if DEQUANTIZE:
+            k = (k_loaded.to(q.dtype) * tl.load(k_scale)).to(q.dtype)
+        else:
+            k = k_loaded
+
         qk = tl.dot(q, k)
         qk *= sm_scale
         qk = tl.where((start_n + offs_bs_n[None, :]) < cur_batch_ctx_len, qk, float("-inf"))
@@ -478,7 +487,11 @@ def _prefix_fwd_kernel(
         alpha = tl.exp(m_i - m_ij)
         acc = acc * alpha[:, None]
 
-        v = tl.load(V_cache + off_v, mask=(start_n + offs_bs_n[:, None]) < cur_batch_ctx_len, other=0.0)
+        v_loaded = tl.load(V_cache + off_v, mask=(start_n + offs_bs_n[:, None]) < cur_batch_ctx_len, other=0.0)
+        if DEQUANTIZE:
+            v = (v_loaded.to(q.dtype) * tl.load(v_scale)).to(q.dtype)
+        else:
+            v = v_loaded
         p = p.to(v.dtype)
         acc = tl.dot(p, v, acc)
 
@@ -526,6 +539,9 @@ def _prefix_attention(
     max_query_len: int,
     sm_scale: float,
     num_kv_heads: int,
+    kv_cache_dtype: str,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
 ) -> torch.Tensor:
     output = torch.empty_like(query)
     batch_size = block_tables.shape[0]
@@ -538,9 +554,11 @@ def _prefix_attention(
 
     x = 16 // key_cache.element_size()
 
+    dequantize = "int8" in kv_cache_dtype or "fp8" in kv_cache_dtype
+
     _prefix_fwd_kernel[grid](
         query, key, value, key_cache, value_cache, block_tables,
-        sm_scale, query_start_loc, seq_lens_tensor, output,
+        k_scale, v_scale, sm_scale, query_start_loc, seq_lens_tensor, output,
         query.stride(0), query.stride(1), query.stride(2),
         key.stride(0), key.stride(1), key.stride(2),
         value.stride(0), value.stride(1), value.stride(2),
@@ -550,7 +568,8 @@ def _prefix_attention(
         value_cache.stride(0), value_cache.stride(1), value_cache.stride(2), value_cache.stride(3),
         num_queries_per_kv=num_heads // num_kv_heads, x=x,
         BLOCK_M=BLOCK_M, BLOCK_DMODEL=head_size, BLOCK_N=BLOCK_N,
-        BLOCK_SIZE=value_cache.shape[3]
+        BLOCK_SIZE=value_cache.shape[3],
+        DEQUANTIZE=dequantize,
     )
     return output
 
