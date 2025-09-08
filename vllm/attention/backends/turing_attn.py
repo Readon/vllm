@@ -473,11 +473,12 @@ def _prefix_fwd_kernel(
 
         k_loaded = tl.load(K_cache + off_k, mask=(start_n + offs_bs_n[None, :]) < cur_batch_ctx_len, other=0.0)
         if DEQUANTIZE:
-            k = (k_loaded.to(q.dtype) * tl.load(k_scale)).to(q.dtype)
+            k = (k_loaded.to(tl.float32) * tl.load(k_scale)).to(q.dtype)
         else:
             k = k_loaded
 
-        qk = tl.dot(q, k)
+        qk = tl.zeros([BLOCK_M, BLOCK_SIZE], dtype=tl.float32)
+        qk = tl.dot(q, k, acc=qk)
         qk *= sm_scale
         qk = tl.where((start_n + offs_bs_n[None, :]) < cur_batch_ctx_len, qk, float("-inf"))
 
@@ -489,7 +490,7 @@ def _prefix_fwd_kernel(
 
         v_loaded = tl.load(V_cache + off_v, mask=(start_n + offs_bs_n[:, None]) < cur_batch_ctx_len, other=0.0)
         if DEQUANTIZE:
-            v = (v_loaded.to(q.dtype) * tl.load(v_scale)).to(q.dtype)
+            v = (v_loaded.to(tl.float32) * tl.load(v_scale)).to(q.dtype)
         else:
             v = v_loaded
         p = p.to(v.dtype)
@@ -505,7 +506,8 @@ def _prefix_fwd_kernel(
         off_v = (cur_batch_in_all_start_index + start_n + offs_n[:, None]) * stride_vbs + cur_kv_head * stride_vh + offs_d[None, :] * stride_vd
 
         k = tl.load(K + off_k, mask=(start_n + offs_n[None, :]) < cur_batch_query_len, other=0.0)
-        qk = tl.dot(q, k)
+        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        qk = tl.dot(q, k, acc=qk)
         qk *= sm_scale
         qk = tl.where(offs_m[:, None] >= (start_n + offs_n[None, :]), qk, float("-inf"))
 
