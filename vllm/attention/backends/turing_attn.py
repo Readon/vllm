@@ -423,6 +423,28 @@ def _run_turing_flash_attention_forward(
     return output.view(num_tokens, num_heads * head_size)
 
 
+turing_autotune_configs = [
+    # Start with smaller block sizes and vary warps/stages
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_stages=2, num_warps=4),
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_stages=3, num_warps=4),
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_stages=2, num_warps=8),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_stages=2, num_warps=4),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_stages=3, num_warps=4),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_stages=2, num_warps=8),
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64}, num_stages=2, num_warps=4),
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64}, num_stages=3, num_warps=4),
+    triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64}, num_stages=2, num_warps=8),
+    # Include some larger block sizes as well
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 64}, num_stages=2, num_warps=4),
+    triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128}, num_stages=2, num_warps=4),
+    triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128}, num_stages=2, num_warps=4),
+]
+
+
+@triton.autotune(
+    configs=turing_autotune_configs,
+    key=['D_HEAD'],
+)
 @triton.jit
 def _turing_attention_kernel_forward(
     Q, K, V, Out,
@@ -535,10 +557,7 @@ def _turing_attention_kernel(
     batch_size = len(cu_seqlens) - 1
     o = torch.empty_like(q)
 
-    BLOCK_M = 64
-    BLOCK_N = 32
-
-    grid = (triton.cdiv(max_seq_len, BLOCK_M), batch_size, num_heads)
+    grid = lambda META: (triton.cdiv(max_seq_len, META['BLOCK_M']), batch_size, num_heads)
 
     # Strides for 3D tensors, interpreted as 4D by the kernel
     stride_qz, stride_qh, stride_qm, stride_qk = 0, q.stride(1), q.stride(0), q.stride(2)
@@ -557,8 +576,6 @@ def _turing_attention_kernel(
         batch_size, num_heads, max_seq_len,
         SCALE=scale,
         D_HEAD=head_size,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
         IS_CAUSAL=is_causal,
     )
     return o
