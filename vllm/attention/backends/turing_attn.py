@@ -524,7 +524,8 @@ def _prefix_fwd_kernel(
         l_i = l_i * alpha + l_ij
         m_i = m_ij
 
-    acc = acc / l_i[:, None]
+    l_i_safe = tl.where(l_i == 0, 1.0, l_i)
+    acc = acc / l_i_safe[:, None]
     off_o = (cur_batch_in_all_start_index + offs_m[:, None]) * stride_obs + cur_head * stride_oh + offs_d[None, :] * stride_od
     tl.store(Out + off_o, acc, mask=offs_m[:, None] < cur_batch_query_len)
 
