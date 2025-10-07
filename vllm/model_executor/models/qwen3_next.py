@@ -60,7 +60,17 @@ from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs import Qwen3NextConfig
 from vllm.triton_utils import tl, triton
 from vllm.utils import direct_register_custom_op
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
+# Import GDNAttention backend - handle both V0 and V1 architectures
+# Check if we should use Turing backend
+import vllm.envs as envs
+use_turing_backend = envs.VLLM_ATTENTION_BACKEND == "TURING"
+
+if use_turing_backend:
+    # Use Turing backend for V1
+    from vllm.v1.attention.backends.turing_gdn_attn import GDNAttentionMetadata
+else:
+    # Use standard V1 backend
+    from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 from .interfaces import (HasInnerState, IsHybrid, MixtureOfExperts,
                          SupportsLoRA, SupportsPP)
@@ -188,8 +198,15 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         return "linear_attention"
 
     def get_attn_backend(self) -> type["AttentionBackend"]:
-        from vllm.v1.attention.backends.gdn_attn import GDNAttentionBackend
-        return GDNAttentionBackend
+        # Check if we should use Turing backend
+        if use_turing_backend:
+            # Use Turing backend for V1
+            from vllm.v1.attention.backends.turing_gdn_attn import GDNAttentionBackend
+            return GDNAttentionBackend
+        else:
+            # Use standard V1 backend
+            from vllm.v1.attention.backends.gdn_attn import GDNAttentionBackend
+            return GDNAttentionBackend
 
     def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
         return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
