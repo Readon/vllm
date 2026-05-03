@@ -81,6 +81,12 @@ class TritonAttentionMetadata:
     prefix_kv_lens: torch.Tensor | None
     suffix_kv_lens: torch.Tensor | None
 
+    # DDTree tree attention bias: [num_tree_tokens, num_tree_tokens] float
+    # 0.0 = attend to this position, -inf = mask out.
+    # When not None, passed as qq_bias to unified_attention for
+    # ancestor-only tree attention during DDTree verification.
+    tree_attn_bias: torch.Tensor | None = None
+
     # Optional aot scheduling
     scheduler_metadata: torch.Tensor | None = None
     prefix_scheduler_metadata: torch.Tensor | None = None
@@ -623,6 +629,7 @@ class TritonAttentionImpl(AttentionImpl):
             window_size=self.sliding_window,
             block_table=block_table,
             softcap=self.logits_soft_cap,
+            qq_bias=attn_metadata.tree_attn_bias,
             q_descale=None,  # Not supported
             k_descale=k_descale,
             v_descale=v_descale,
