@@ -146,6 +146,22 @@ class SpeculativeConfig:
     requires the speculative model be trained to support parallel drafting.
     Only compatible with EAGLE and draft model methods."""
 
+    # DDTree configuration (for MTP speculative decoding)
+    ddtree_budget: int = Field(default=0, ge=0)
+    """Maximum number of non-root tree nodes for DDTree verification.
+    When > 0, enables DDTree tree-structured verification for MTP
+    speculative decoding. Default 0 (disabled, uses chain verification)."""
+    ddtree_topk: int = Field(default=5, ge=2)
+    """Top-K candidates per position for DDTree tree construction."""
+    ddtree_chain_seed: bool = Field(default=True)
+    """If True, pre-seed the top-1 chain in DDTree to guarantee acceptance
+    rate >= chain mode (defensive, compensates for flat softmax)."""
+    ddtree_mtp_depth: int = Field(default=0, ge=0)
+    """Number of MTP forward steps for DDTree draft. When > 0, the MTP
+    chain runs this many steps (collecting top-K at each), then DDTree
+    builds a tree with ddtree_budget nodes. This allows a wider tree
+    from fewer MTP steps. When 0, defaults to num_speculative_tokens."""
+
     # required configuration params passed from engine
     target_model_config: SkipValidation[ModelConfig] = None  # type: ignore
     """The configuration of the target model."""
@@ -436,6 +452,87 @@ class SpeculativeConfig:
 
         return hf_config
 
+    @staticmethod
+    def hf_config_override_draft(
+        hf_config: PretrainedConfig,
+    ) -> PretrainedConfig:
+        """
+        Like hf_config_override but skips qwen3_5 -> qwen3_5_mtp conversion.
+        Qwen3_5MTP requires hidden_states from a parent model and cannot
+        function as an independent draft model.
+        """
+        initial_architecture = hf_config.architectures[0]
+        # Apply all overrides except qwen3_5 MTP conversion
+        if hf_config.model_type in ("deepseek_v3", "deepseek_v32", "glm_moe_dsa"):
+            hf_config.model_type = "deepseek_mtp"
+        if hf_config.model_type == "deepseek_mtp":
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
+            hf_config.update({"n_predict": n_predict, "architectures": ["DeepSeekMTPModel"]})
+        if hf_config.model_type in ("pangu_ultra_moe"):
+            hf_config.model_type = "pangu_ultra_moe_mtp"
+        if hf_config.model_type == "pangu_ultra_moe_mtp":
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
+            hf_config.update({"n_predict": n_predict, "architectures": ["OpenPanguMTPModel"]})
+        if hf_config.architectures[0] == "MiMoForCausalLM":
+            hf_config.model_type = "mimo_mtp"
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
+            hf_config.update({"num_hidden_layers": 0, "n_predict": n_predict, "architectures": ["MiMoMTPModel"]})
+        if hf_config.architectures[0] == "Glm4MoeForCausalLM":
+            hf_config.model_type = "glm4_moe_mtp"
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
+            hf_config.update({"n_predict": n_predict, "architectures": ["Glm4MoeMTPModel"]})
+        if hf_config.architectures[0] == "Glm4MoeLiteForCausalLM":
+            hf_config.model_type = "glm4_moe_lite_mtp"
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
+            hf_config.update({"num_hidden_layers": 0, "n_predict": n_predict, "architectures": ["Glm4MoeLiteMTPModel"]})
+        if hf_config.architectures[0] == "GlmOcrForConditionalGeneration":
+            hf_config.model_type = "glm_ocr_mtp"
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
+            hf_config.update({"num_hidden_layers": 0, "n_predict": n_predict, "architectures": ["GlmOcrMTPModel"]})
+        if hf_config.model_type == "ernie4_5_moe":
+            hf_config.model_type = "ernie_mtp"
+        if hf_config.model_type == "ernie_mtp":
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
+            hf_config.update({"n_predict": n_predict, "architectures": ["ErnieMTPModel"]})
+        if hf_config.architectures[0] == "NemotronH_Super_Omni_Reasoning_V3":
+            hf_config = hf_config.text_config
+        if (
+            hf_config.model_type in {"nemotron_h", "nemotron_h_puzzle"}
+            and hasattr(hf_config, "num_nextn_predict_layers")
+            and hf_config.num_nextn_predict_layers > 0
+        ):
+            hf_config.model_type = "nemotron_h_mtp"
+        if hf_config.model_type == "nemotron_h_mtp":
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
+            hf_config.update({"n_predict": n_predict, "architectures": ["NemotronHMTPModel"]})
+        if hf_config.model_type == "qwen3_next":
+            hf_config.model_type = "qwen3_next_mtp"
+        if hf_config.model_type == "qwen3_next_mtp":
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
+            hf_config.update({"n_predict": n_predict, "architectures": ["Qwen3NextMTP"]})
+        if hf_config.model_type == "exaone_moe":
+            hf_config.model_type = "exaone_moe_mtp"
+        if hf_config.model_type == "exaone_moe_mtp":
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
+            hf_config.update({"n_predict": n_predict, "architectures": ["ExaoneMoeMTP"]})
+        if "exaone4_5" in hf_config.model_type:
+            hf_config.model_type = "exaone4_5_mtp"
+        if hf_config.model_type == "exaone4_5_mtp":
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", None)
+            hf_config.update({"n_predict": n_predict, "architectures": ["Exaone4_5_MTP"]})
+        # NOTE: Skip qwen3_5 -> qwen3_5_mtp for draft_model method
+        if hf_config.model_type == "longcat_flash":
+            hf_config.model_type = "longcat_flash_mtp"
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
+            hf_config.update({"n_predict": n_predict, "architectures": ["LongCatFlashMTPModel"]})
+        if hf_config.model_type == "step3p5":
+            hf_config.model_type = "step3p5_mtp"
+            n_predict = getattr(hf_config, "num_nextn_predict_layers", 1)
+            hf_config.update({"n_predict": n_predict, "architectures": ["Step3p5MTP"]})
+        if initial_architecture == "MistralLarge3ForCausalLM":
+            hf_config.update({"architectures": ["EagleMistralLarge3ForCausalLM"]})
+        return hf_config
+
     def __post_init__(self):
         # Note: "method" is a new parameter that helps to extend the
         # configuration of non-model-based proposers, and the "model" parameter
@@ -556,6 +653,12 @@ class SpeculativeConfig:
             self.prompt_lookup_min = 0
 
             if self.model is not None:
+                # For draft_model method, skip MTP architecture conversion
+                _hf_overrides = (
+                    SpeculativeConfig.hf_config_override_draft
+                    if self.method == "draft_model"
+                    else SpeculativeConfig.hf_config_override
+                )
                 self.draft_model_config = ModelConfig(
                     model=self.model,
                     runner="draft",
@@ -573,12 +676,12 @@ class SpeculativeConfig:
                     quantization=self.quantization,
                     enforce_eager=self.target_model_config.enforce_eager,
                     max_logprobs=self.target_model_config.max_logprobs,
-                    hf_overrides=SpeculativeConfig.hf_config_override,
+                    hf_overrides=_hf_overrides,
                     config_format=self.target_model_config.config_format,
                 )
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3", "dflash"):
+                if self.method in ("eagle", "eagle3", "dflash", "draft_model"):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
@@ -980,6 +1083,10 @@ class SpeculativeConfig:
 
     def use_ngram_gpu(self) -> bool:
         return self.method == "ngram_gpu"
+
+    def use_ddtree(self) -> bool:
+        """Check if DDTree tree verification is enabled."""
+        return self.ddtree_budget > 0
 
     def __repr__(self) -> str:
         method = self.method

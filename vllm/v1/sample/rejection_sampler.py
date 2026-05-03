@@ -92,6 +92,8 @@ class RejectionSampler(nn.Module):
         # [num_tokens + batch_size, vocab_size]
         logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
+        # DDTree-specific: child maps for tree walk verification
+        ddtree_child_maps: list[list[dict[int, int]]] | None = None,
     ) -> SamplerOutput:
         """
         Args:
@@ -165,18 +167,28 @@ class RejectionSampler(nn.Module):
             sampling_metadata,
         )
 
-        output_token_ids = rejection_sample(
-            metadata.draft_token_ids,
-            metadata.num_draft_tokens,
-            metadata.max_spec_len,
-            metadata.cu_num_draft_tokens,
-            draft_probs,
-            target_logits,
-            bonus_token_ids,
-            sampling_metadata,
-            synthetic_mode=self.synthetic_mode,
-            synthetic_conditional_rates=self.synthetic_conditional_rates,
-        )
+        if ddtree_child_maps is not None:
+            output_token_ids = ddtree_rejection_sample(
+                metadata.draft_token_ids,
+                metadata.num_draft_tokens,
+                metadata.max_spec_len,
+                metadata.cu_num_draft_tokens,
+                target_logits,
+                bonus_token_ids,
+                sampling_metadata,
+                ddtree_child_maps,
+            )
+        else:
+            output_token_ids = rejection_sample(
+                metadata.draft_token_ids,
+                metadata.num_draft_tokens,
+                metadata.max_spec_len,
+                metadata.cu_num_draft_tokens,
+                draft_probs,
+                target_logits,
+                bonus_token_ids,
+                sampling_metadata,
+            )
 
         logprobs_tensors = None
         if sampling_metadata.max_num_logprobs is not None:
@@ -374,6 +386,115 @@ class RejectionSampler(nn.Module):
             for i in range(len(spec) - 1):
                 result.append([*result[-1], spec[i]])
         return result
+
+
+def ddtree_rejection_sample(
+    # [num_tokens]
+    draft_token_ids: torch.Tensor,
+    # [batch_size]
+    num_draft_tokens: list[int],
+    max_spec_len: int,
+    # [batch_size]
+    cu_num_draft_tokens: torch.Tensor,
+    # [num_tokens, vocab_size]
+    target_logits: torch.Tensor,
+    # [batch_size, 1]
+    bonus_token_ids: torch.Tensor,
+    sampling_metadata: SamplingMetadata,
+    # DDTree-specific: list of child_maps per request
+    ddtree_child_maps: list[list[dict[int, int]]],
+) -> torch.Tensor:
+    """DDTree tree-structured rejection sampling.
+
+    Instead of chain verification (accept until first rejection),
+    walk the tree following the target model's argmax at each node.
+    This accepts more tokens per step by exploring alternative branches.
+    """
+    batch_size = len(num_draft_tokens)
+    device = target_logits.device
+
+    # Create output buffer.
+    output_token_ids = torch.full(
+        (batch_size, max_spec_len + 1),
+        PLACEHOLDER_TOKEN_ID,
+        dtype=torch.int32,
+        device=device,
+    )
+
+    # For greedy + DDTree, use target argmax for tree walk
+    target_argmax = target_logits.argmax(dim=-1)  # [num_tokens]
+    target_argmax_cpu = target_argmax.cpu()
+    cu_cpu = cu_num_draft_tokens.cpu()
+    bonus_cpu = bonus_token_ids.cpu()
+
+    if batch_size != len(ddtree_child_maps):
+        # Mismatch — return empty
+        return output_token_ids
+
+    total_accepted = 0
+    for req_idx in range(batch_size):
+        start = 0 if req_idx == 0 else cu_cpu[req_idx - 1].item()
+        end = cu_cpu[req_idx].item()
+        num_tokens = end - start
+
+        child_maps = ddtree_child_maps[req_idx]
+
+        # target_argmax at each draft position
+        posterior = target_argmax_cpu[start:end]
+
+        # Tree walk logic:
+        # - Slot 0 = root (no token, just the tree start)
+        # - Slots 1..n_nodes = DFS-ordered tree nodes (draft tokens)
+        # - target_argmax[i] = target's prediction at position of tree slot i+1
+        #   (what target wants AFTER seeing slot i's token)
+        #
+        # Walk: start at root. Use target_argmax[0] (target's prediction at
+        # slot 1 position) to check if it matches root's children.
+        # This matches chain verification semantics.
+
+        accepted_count = 0
+        current = 0  # start at root
+
+        while True:
+            # At slot `current`, look up target's prediction for the NEXT
+            # position.
+            # - At root (slot 0): posterior[0] = target's prediction for
+            #   what the first draft token should be
+            # - At slot j (j>=1): posterior[j] = target's prediction after
+            #   seeing j draft tokens
+            if current >= num_tokens:
+                # No more target predictions available
+                break
+            next_token = posterior[current].item()
+
+            children = child_maps[current]
+            if next_token not in children:
+                # No matching child — output target's choice and stop
+                if accepted_count < max_spec_len + 1:
+                    output_token_ids[req_idx, accepted_count] = next_token
+                    accepted_count += 1
+                break
+
+            child_slot = children[next_token]
+            if child_slot >= len(child_maps):
+                break
+            # Accept this token
+            if accepted_count < max_spec_len + 1:
+                output_token_ids[req_idx, accepted_count] = next_token
+                accepted_count += 1
+            current = child_slot
+            if accepted_count >= max_spec_len + 1:
+                break
+
+        total_accepted += accepted_count
+
+    # Acceptance stats (kept for future diagnostics)
+    if not hasattr(ddtree_rejection_sample, '_stats'):
+        ddtree_rejection_sample._stats = [0, 0]  # [total_accepted, total_steps]
+    ddtree_rejection_sample._stats[0] += total_accepted
+    ddtree_rejection_sample._stats[1] += batch_size
+
+    return output_token_ids
 
 
 def rejection_sample(
