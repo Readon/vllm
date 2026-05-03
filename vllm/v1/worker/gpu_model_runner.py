@@ -3208,6 +3208,24 @@ class GPUModelRunner(
         inputs_embeds = self.inputs_embeds.gpu[:num_tokens]
         return input_ids, inputs_embeds
 
+    def _inject_ddtree_attn_bias(self, attn_metadata):
+        """Inject pre-allocated DDTree qq_bias buffer into attention metadata.
+
+        The buffer is always the same tensor (fixed data_ptr) to maintain
+        CUDA graph compatibility. Content is updated in-place via copy_()
+        during DDTree propose. Zeros during normal decode (no effect).
+        """
+        from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadata
+        buf = self.drafter._ddtree_qq_buf
+        if buf is None:
+            return
+        if isinstance(attn_metadata, dict):
+            for layer_name, layer_md in attn_metadata.items():
+                if isinstance(layer_md, TritonAttentionMetadata):
+                    # Always set to the same pre-allocated buffer.
+                    # This keeps tensor identity stable for CUDA graphs.
+                    layer_md.tree_attn_bias = buf
+
     def _preprocess(
         self,
         scheduler_output: "SchedulerOutput",
@@ -3348,11 +3366,17 @@ class GPUModelRunner(
             draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
 
+        # Pass DDTree child maps only during verification steps
+        ddtree_child_maps = None
+        if (spec_decode_metadata is not None
+                and hasattr(self.drafter, '_ddtree_child_maps')):
+            ddtree_child_maps = self.drafter._ddtree_child_maps
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
             None,  # draft_probs
             logits,
             sampling_metadata,
+            ddtree_child_maps=ddtree_child_maps,
         )
         return sampler_output
 
@@ -4009,6 +4033,14 @@ class GPUModelRunner(
             ) = self._preprocess(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
+
+            # DDTree: always inject pre-allocated qq_bias buffer.
+            # This ensures CUDA graph capture includes the qq_bias path.
+            # Buffer is zeros during non-DDTree steps (no effect on attention).
+            if (hasattr(self, 'drafter')
+                    and hasattr(self.drafter, '_ddtree_qq_buf')
+                    and self.drafter._ddtree_qq_buf is not None):
+                self._inject_ddtree_attn_bias(attn_metadata)
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
@@ -6589,7 +6621,20 @@ class GPUModelRunner(
                 if layer_name in self.runner_only_attn_layers:
                     continue
                 raw_tensor = kv_cache_raw_tensors[layer_name]
-                assert raw_tensor.numel() % kv_cache_spec.page_size_bytes == 0
+                remainder = raw_tensor.numel() % kv_cache_spec.page_size_bytes
+                if remainder != 0:
+                    logger.error(
+                        "KV cache reshape failed for layer %s: "
+                        "raw_tensor.numel()=%d, page_size=%d, remainder=%d",
+                        layer_name,
+                        raw_tensor.numel(),
+                        kv_cache_spec.page_size_bytes,
+                        remainder,
+                    )
+                assert remainder == 0, (
+                    f"raw_tensor.numel()={raw_tensor.numel()} not divisible by "
+                    f"page_size={kv_cache_spec.page_size_bytes} for {layer_name}"
+                )
                 num_blocks = raw_tensor.numel() // kv_cache_spec.page_size_bytes
                 if isinstance(kv_cache_spec, AttentionSpec):
                     has_attn = True
