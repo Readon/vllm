@@ -8,8 +8,6 @@ if [ -z "${RELEASE_VERSION}" ]; then
   RELEASE_VERSION="1.0.0.dev"
 fi
 
-ROCM_BASE_CACHE_KEY=$(.buildkite/scripts/cache-rocm-base-wheels.sh key)
-
 buildkite-agent annotate --style 'info' --context 'release-workflow' << EOF
 To download the wheel (by commit):
 \`\`\`
