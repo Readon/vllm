@@ -585,6 +585,16 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         needs_squeeze = hidden_states.dim() == 1
         if needs_squeeze:
             hidden_states = hidden_states.unsqueeze(0)
+        # Ensure hidden_states dtype matches fc layer weight dtype.
+        # When the target model is loaded with a different dtype (e.g., fp16
+        # for AWQ) the hidden states may be in fp32 while fc weights are fp16.
+        fc_weight = (
+            self.model.fc.weight
+            if hasattr(self.model.fc, "weight")
+            else getattr(self.model.fc, "q_weight", None)
+        )
+        if fc_weight is not None and hidden_states.dtype != fc_weight.dtype:
+            hidden_states = hidden_states.to(fc_weight.dtype)
         result = self.model.fc(hidden_states)
         if needs_squeeze:
             result = result.squeeze(0)

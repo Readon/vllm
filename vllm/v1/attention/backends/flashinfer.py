@@ -244,6 +244,7 @@ class BatchDCPPrefillWrapper:
         kv_cache_dtype: torch.dtype,
         prefill_fixed_split_size: int,
         disable_split_kv: bool,
+        causal: bool = False,  # Add causal parameter for DFlash support
     ):
         """Plan the prefill operation with given parameters."""
         self._context.plan(
@@ -255,7 +256,7 @@ class BatchDCPPrefillWrapper:
             num_kv_heads=num_kv_heads,
             head_dim_qk=head_dim,
             page_size=page_size,
-            causal=False,  # This is context run
+            causal=causal,  # Use dynamic causal parameter
             sm_scale=sm_scale,
             window_left=window_left,
             logits_soft_cap=logits_soft_cap,
@@ -271,7 +272,7 @@ class BatchDCPPrefillWrapper:
             num_kv_heads=num_kv_heads,
             head_dim_qk=head_dim,
             head_dim_vo=head_dim,
-            causal=True,  # This is newtokens run
+            causal=True,  # This is newtokens run (always causal)
             sm_scale=sm_scale,
             window_left=window_left,
             logits_soft_cap=logits_soft_cap,
@@ -408,6 +409,15 @@ class FlashInferBackend(AttentionBackend):
         )
 
     @classmethod
+    def supports_non_causal(cls) -> bool:
+        """FlashInfer supports non-causal (bidirectional) attention.
+        
+        This is required for DFlash speculative decoding which uses
+        cross-attention between target model's hidden states and draft tokens.
+        """
+        return True
+
+    @classmethod
     def supports_sink(cls) -> bool:
         """FlashInfer supports sinks when TRTLLM attention is available (SM100)."""
         from vllm.utils.flashinfer import (
@@ -531,6 +541,12 @@ class FlashInferMetadata:
     """
 
     cascade_wrapper: MultiLevelCascadeAttentionWrapper | None
+
+    causal: bool = True
+    """
+    Whether to apply causal mask to the attention matrix.
+    Set to False for non-causal (bidirectional) attention, e.g., DFlash.
+    """
 
 
 class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
@@ -894,6 +910,10 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         qo_indptr = common_attn_metadata.query_start_loc
         qo_indptr_cpu = common_attn_metadata.query_start_loc_cpu
 
+        # Get causal setting from common attention metadata
+        # For DFlash speculative decoding, causal=False enables non-causal attention
+        causal = common_attn_metadata.causal
+
         # Step 1: Decide which dispatch modes to use:
         # - Cascade attention (distinct mode)
         # - Prefill (FI native or TRTLLM)
@@ -961,6 +981,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             prefill=None,
             decode=None,
             cascade_wrapper=None,
+            causal=causal,
         )
 
         # Guard access to seq_lens_cpu, which may not always be needed
@@ -1061,7 +1082,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 num_kv_heads=self.num_kv_heads,
                 head_dim=self.head_dim,
                 page_size=self.page_size,
-                causal=True,
+                causal=causal,
                 sm_scale=self.sm_scale,
                 window_left=self.window_left,
                 logits_soft_cap=self.logits_soft_cap,
@@ -1142,6 +1163,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         kv_cache_dtype=self.kv_cache_dtype,
                         prefill_fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
+                        causal=causal,  # Pass causal parameter for DFlash
                     )
                 else:
                     assert isinstance(
@@ -1157,7 +1179,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         num_kv_heads=self.num_kv_heads,
                         head_dim_qk=self.head_dim,
                         page_size=self.page_size,
-                        causal=True,
+                        causal=causal,
                         sm_scale=self.sm_scale,
                         window_left=self.window_left,
                         logits_soft_cap=self.logits_soft_cap,
@@ -1474,7 +1496,7 @@ class FlashInferImpl(AttentionImpl):
                         self.logits_soft_cap or 0.0
                     )
                     assert prefill_wrapper._context._sm_scale == self.scale
-                    assert not prefill_wrapper._context._causal
+                    assert prefill_wrapper._context._causal == attn_metadata.causal
                     assert prefill_wrapper._new_tokens._window_left == self.window_left
                     assert prefill_wrapper._new_tokens._logits_soft_cap == (
                         self.logits_soft_cap or 0.0
@@ -1499,7 +1521,7 @@ class FlashInferImpl(AttentionImpl):
                         self.logits_soft_cap or 0.0
                     )
                     assert prefill_wrapper._sm_scale == self.scale
-                    assert prefill_wrapper._causal
+                    assert prefill_wrapper._causal == attn_metadata.causal
                     prefill_wrapper.run(
                         prefill_query,
                         kv_cache_permute,
