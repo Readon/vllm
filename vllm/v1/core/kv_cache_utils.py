@@ -1049,6 +1049,25 @@ def is_kv_cache_type_attention_free(kv_cache_spec: dict[str, KVCacheSpec]) -> bo
     return not kv_cache_spec
 
 
+def _get_kv_cache_groups_per_layer(
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> list[KVCacheGroupSpec]:
+    """
+    Fallback: create one KV cache group per layer when page size unification
+    fails (e.g., draft model with different hidden size in speculative decoding).
+    Each layer gets its own group with 1 layer.
+    """
+    groups = []
+    for layer_name, layer_spec in kv_cache_spec.items():
+        groups.append(
+            KVCacheGroupSpec(
+                layer_names=[layer_name],
+                kv_cache_spec=layer_spec,
+            )
+        )
+    return groups
+
+
 def _get_kv_cache_groups_uniform_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> list[KVCacheGroupSpec]:
@@ -1282,32 +1301,277 @@ def get_kv_cache_config_from_groups(
             vllm_config, kv_cache_groups, available_memory
         )
     else:
-        # General case:
-        # We will have group_size memory pools, each is shared by one layer from
-        # each group. As layers of different groups have different block table,
-        # they will use different parts of the shared Tensor.
-        # The memory layout for 3 groups (full.0, full.1), (sw.0, sw.2),
-        # (sw.1, padding) will be: (group_size = 2)
-        # full.0, sw.0, sw.1: share a Tensor with size=available_memory//2
-        # full.1, sw.2: share another Tensor with size=available_memory//2
-        group_size = max(len(group.layer_names) for group in kv_cache_groups)
+        # Check if all groups share the same page size.
+        # If not (e.g., draft model with different hidden size), allocate
+        # independent tensors per group (following llama.cpp's approach of
+        # independent KV cache pools per model context).
+        all_page_sizes = set()
+        for group in kv_cache_groups:
+            spec = group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                for ls in spec.kv_cache_specs.values():
+                    all_page_sizes.add(ls.page_size_bytes)
+            else:
+                all_page_sizes.add(spec.page_size_bytes)
 
-        page_size = get_uniform_page_size(
-            [group.kv_cache_spec for group in kv_cache_groups]
-        )
-        assert group_size > 0, "group_size must be greater than 0"
-        num_blocks = get_num_blocks(
-            vllm_config, group_size, available_memory, page_size
-        )
-        kv_cache_tensors = []
-        for i in range(group_size):
-            shared_by = []
-            for j in range(len(kv_cache_groups)):
-                if i < len(kv_cache_groups[j].layer_names):
-                    shared_by.append(kv_cache_groups[j].layer_names[i])
-            kv_cache_tensors.append(
-                KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
+        if len(all_page_sizes) > 1:
+            # Non-uniform page sizes across groups (e.g., draft model with
+            # different hidden size). Allocate independent tensors per group.
+            # Following llama.cpp's approach of independent KV cache pools,
+            # but adapted for vLLM's shared memory model.
+            #
+            # Strategy: identify which groups belong to the "primary" model
+            # (target) vs. secondary model (draft). Give primary model the bulk
+            # of memory, then allocate what remains to the draft model.
+            
+            # Check for num_gpu_blocks_override (used during profiling)
+            override_blocks = (
+                vllm_config.cache_config.num_gpu_blocks_override
+                if vllm_config.cache_config.num_gpu_blocks_override is not None
+                else None
             )
+            
+            primary_groups = []
+            secondary_groups = []
+            for group in kv_cache_groups:
+                has_draft_layer = any(
+                    ln.startswith("draft_model.") for ln in group.layer_names
+                )
+                if has_draft_layer:
+                    secondary_groups.append(group)
+                else:
+                    primary_groups.append(group)
+
+            # Determine page size for primary groups
+            primary_page_sizes = set()
+            for group in primary_groups:
+                spec = group.kv_cache_spec
+                if isinstance(spec, UniformTypeKVCacheSpecs):
+                    for ls in spec.kv_cache_specs.values():
+                        primary_page_sizes.add(ls.page_size_bytes)
+                else:
+                    primary_page_sizes.add(spec.page_size_bytes)
+
+            # Use override blocks if set (for profiling), otherwise compute from memory
+            effective_primary_blocks = override_blocks
+            if effective_primary_blocks is None:
+                primary_group_size = max(
+                    len(g.layer_names) for g in primary_groups
+                )
+                effective_primary_blocks = get_num_blocks(
+                    vllm_config,
+                    primary_group_size,
+                    available_memory,
+                    max(primary_page_sizes) if primary_page_sizes else 1,
+                )
+
+            # Allocate primary groups
+            kv_cache_tensors = []
+            primary_num_blocks = 0
+            if primary_groups:
+                logger.info(
+                    "Primary groups: %d, page_sizes: %s, override_blocks: %s",
+                    len(primary_groups), primary_page_sizes, override_blocks,
+                )
+                if len(primary_page_sizes) == 1:
+                    primary_page_size = primary_page_sizes.pop()
+                    primary_group_size = max(
+                        len(g.layer_names) for g in primary_groups
+                    )
+                    # Reserve memory for draft model if present
+                    reserve_for_draft = 0
+                    if secondary_groups:
+                        secondary_total_ps = 0
+                        for group in secondary_groups:
+                            spec = group.kv_cache_spec
+                            if isinstance(spec, UniformTypeKVCacheSpecs):
+                                secondary_total_ps += sum(
+                                    ls.page_size_bytes
+                                    for ls in spec.kv_cache_specs.values()
+                                )
+                            else:
+                                secondary_total_ps += spec.page_size_bytes
+                        min_draft_blocks = override_blocks or 4
+                        reserve_for_draft = secondary_total_ps * min_draft_blocks
+                    adjusted_memory = max(0, available_memory - reserve_for_draft)
+                    effective_primary_blocks = get_num_blocks(
+                        vllm_config,
+                        primary_group_size,
+                        adjusted_memory,
+                        primary_page_size,
+                    )
+                    primary_num_blocks = effective_primary_blocks
+                    for i in range(primary_group_size):
+                        shared_by = []
+                        for j in range(len(primary_groups)):
+                            if i < len(primary_groups[j].layer_names):
+                                shared_by.append(primary_groups[j].layer_names[i])
+                        kv_cache_tensors.append(
+                            KVCacheTensor(
+                                size=primary_page_size * primary_num_blocks,
+                                shared_by=shared_by,
+                            )
+                        )
+                else:
+                    # Primary groups have non-uniform page sizes
+                    # (e.g., hybrid attention model with FullAttention + MambaSpec).
+                    # Distribute available memory proportionally among groups.
+                    # Reserve some memory for draft model if present.
+                    reserve_for_draft = 0
+                    if secondary_groups:
+                        secondary_total_ps = sum(
+                            g.kv_cache_spec.page_size_bytes
+                            for g in secondary_groups
+                        )
+                        # Reserve at least enough for min override blocks
+                        min_draft_blocks = override_blocks or 4
+                        reserve_for_draft = secondary_total_ps * min_draft_blocks
+
+                    primary_budget = available_memory - reserve_for_draft
+
+                    # Compute per-group cost (total page size of all layers in group)
+                    group_costs = []
+                    for group in primary_groups:
+                        spec = group.kv_cache_spec
+                        if isinstance(spec, UniformTypeKVCacheSpecs):
+                            cost = sum(
+                                ls.page_size_bytes
+                                for ls in spec.kv_cache_specs.values()
+                            )
+                        else:
+                            cost = spec.page_size_bytes * len(group.layer_names)
+                        group_costs.append(cost)
+
+                    total_cost = sum(group_costs)
+                    if total_cost == 0:
+                        primary_num_blocks = effective_primary_blocks
+                    else:
+                        # Allocate proportionally
+                        for idx, (group, cost) in enumerate(
+                            zip(primary_groups, group_costs)
+                        ):
+                            frac = cost / total_cost
+                            group_budget = int(primary_budget * frac)
+                            spec = group.kv_cache_spec
+                            if isinstance(spec, UniformTypeKVCacheSpecs):
+                                max_ps = max(
+                                    ls.page_size_bytes
+                                    for ls in spec.kv_cache_specs.values()
+                                )
+                                group_blocks = group_budget // max_ps
+                                for layer_name in group.layer_names:
+                                    layer_ps = spec.kv_cache_specs[layer_name].page_size_bytes
+                                    kv_cache_tensors.append(
+                                        KVCacheTensor(
+                                            size=layer_ps * group_blocks,
+                                            shared_by=[layer_name],
+                                        )
+                                    )
+                                primary_num_blocks = max(
+                                    primary_num_blocks, group_blocks
+                                )
+                            else:
+                                page_size = spec.page_size_bytes
+                                group_blocks = group_budget // page_size
+                                kv_cache_tensors.append(
+                                    KVCacheTensor(
+                                        size=page_size * group_blocks,
+                                        shared_by=list(group.layer_names),
+                                    )
+                                )
+                                primary_num_blocks = max(
+                                    primary_num_blocks, group_blocks
+                                )
+
+            # Calculate remaining memory for secondary (draft) groups
+            primary_memory_used = sum(t.size for t in kv_cache_tensors)
+            secondary_memory = max(0, available_memory - primary_memory_used)
+            
+            # For draft model, give a fraction of remaining memory
+            # If override is set, use a smaller number of blocks for draft
+            effective_secondary_blocks = override_blocks
+            if effective_secondary_blocks is None:
+                # Compute total per-block cost across all secondary groups
+                # to avoid over-allocation when groups have different page sizes.
+                secondary_total_ps = 0
+                for group in secondary_groups:
+                    spec = group.kv_cache_spec
+                    if isinstance(spec, UniformTypeKVCacheSpecs):
+                        secondary_total_ps += sum(
+                            ls.page_size_bytes
+                            for ls in spec.kv_cache_specs.values()
+                        )
+                    else:
+                        secondary_total_ps += spec.page_size_bytes
+                effective_secondary_blocks = (
+                    secondary_memory // secondary_total_ps
+                    if secondary_total_ps > 0
+                    else 0
+                )
+
+            logger.info(
+                "Allocating %d bytes (%.1f%%) for draft model KV cache "
+                "(%d blocks) (total=%d, primary used=%d)",
+                secondary_memory,
+                (secondary_memory / available_memory * 100 if available_memory > 0 else 0),
+                effective_secondary_blocks,
+                available_memory,
+                primary_memory_used,
+            )
+
+            # Allocate secondary groups from remaining memory
+            secondary_num_blocks = 0
+            for group in secondary_groups:
+                spec = group.kv_cache_spec
+                if isinstance(spec, UniformTypeKVCacheSpecs):
+                    for layer_name in group.layer_names:
+                        layer_ps = spec.kv_cache_specs[layer_name].page_size_bytes
+                        kv_cache_tensors.append(
+                            KVCacheTensor(
+                                size=layer_ps * effective_secondary_blocks,
+                                shared_by=[layer_name],
+                            )
+                        )
+                    secondary_num_blocks = effective_secondary_blocks
+                else:
+                    page_size = spec.page_size_bytes
+                    kv_cache_tensors.append(
+                        KVCacheTensor(
+                            size=page_size * effective_secondary_blocks,
+                            shared_by=list(group.layer_names),
+                        )
+                    )
+                    secondary_num_blocks = effective_secondary_blocks
+
+            num_blocks = max(primary_num_blocks, secondary_num_blocks)
+            num_blocks = may_override_num_blocks(vllm_config, num_blocks)
+        else:
+            # General case: uniform page size across all groups.
+            # We will have group_size memory pools, each is shared by one layer
+            # from each group. As layers of different groups have different block
+            # table, they will use different parts of the shared Tensor.
+            # The memory layout for 3 groups (full.0, full.1), (sw.0, sw.2),
+            # (sw.1, padding) will be: (group_size = 2)
+            # full.0, sw.0, sw.1: share a Tensor with size=available_memory//2
+            # full.1, sw.2: share another Tensor with size=available_memory//2
+            group_size = max(len(group.layer_names) for group in kv_cache_groups)
+
+            page_size = get_uniform_page_size(
+                [group.kv_cache_spec for group in kv_cache_groups]
+            )
+            assert group_size > 0, "group_size must be greater than 0"
+            num_blocks = get_num_blocks(
+                vllm_config, group_size, available_memory, page_size
+            )
+            kv_cache_tensors = []
+            for i in range(group_size):
+                shared_by = []
+                for j in range(len(kv_cache_groups)):
+                    if i < len(kv_cache_groups[j].layer_names):
+                        shared_by.append(kv_cache_groups[j].layer_names[i])
+                kv_cache_tensors.append(
+                    KVCacheTensor(size=page_size * num_blocks, shared_by=shared_by)
+                )
 
     return KVCacheConfig(
         num_blocks=num_blocks,
@@ -1606,6 +1870,35 @@ def _annotate_eagle_groups_deepseek_v4(
         if last_layer in group.layer_names:
             group.is_eagle_group = True
             break
+def _split_draft_model_layers(
+    kv_cache_spec: dict[str, KVCacheSpec],
+) -> tuple[dict[str, KVCacheSpec], dict[str, KVCacheSpec]]:
+    """
+    Split KV cache specs into target model and draft model layers.
+
+    Inspired by llama.cpp's speculative decoding implementation:
+    https://github.com/ggml-org/llama.cpp/blob/master/docs/speculative-decoding-implementation.md
+
+    llama.cpp loads target and draft models as completely independent contexts,
+    each with their own KV cache pool. They don't share any infrastructure.
+    Here we achieve the same effect by separating draft model layers (prefixed
+    with 'draft_model.') into their own spec dict so they can be grouped
+    independently with their own page size.
+
+    Args:
+        kv_cache_spec: Combined KV cache specs for all layers.
+
+    Returns:
+        Tuple of (target_specs, draft_specs). Either may be empty.
+    """
+    target_specs: dict[str, KVCacheSpec] = {}
+    draft_specs: dict[str, KVCacheSpec] = {}
+    for layer_name, layer_spec in kv_cache_spec.items():
+        if layer_name.startswith("draft_model."):
+            draft_specs[layer_name] = layer_spec
+        else:
+            target_specs[layer_name] = layer_spec
+    return target_specs, draft_specs
 
 
 def get_kv_cache_groups(
@@ -1614,6 +1907,11 @@ def get_kv_cache_groups(
     """
     Split the layers in the model into groups with the same KV cache spec.
 
+    For speculative decoding with draft_model method, separates draft model
+    layers into independent groups so they can use their own page size without
+    requiring unification with the target model (following llama.cpp's approach
+    of independent model contexts).
+
     Args:
         vllm_config: The global VllmConfig
         kv_cache_spec: The kv cache spec of each attention layer in the model
@@ -1621,10 +1919,23 @@ def get_kv_cache_groups(
     Returns:
         The generated KVCacheGroups
     """
-    if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
-        unify_hybrid_kv_cache_specs(kv_cache_spec)
+    # Separate draft model layers for independent grouping (llama.cpp style)
+    has_draft = any(name.startswith("draft_model.") for name in kv_cache_spec)
+    if has_draft:
+        logger.info(
+            "Separating draft model layers into independent KV cache groups "
+            "(following llama.cpp's independent context approach)."
+        )
+        target_specs, draft_specs = _split_draft_model_layers(kv_cache_spec)
+    else:
+        target_specs = kv_cache_spec
+        draft_specs = {}
 
-    if is_kv_cache_type_attention_free(kv_cache_spec):
+    # Process target specs using the original grouping logic
+    if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
+        unify_hybrid_kv_cache_specs(target_specs)
+
+    if is_kv_cache_type_attention_free(target_specs) and not draft_specs:
         # This returns an empty list to allow for the KVCacheManager to handle
         # attention free models.
         return []
@@ -1647,16 +1958,51 @@ def get_kv_cache_groups(
         kv_cache_groups = _get_kv_cache_groups_uniform_groups(grouped_specs)
         _annotate_eagle_groups_deepseek_v4(vllm_config, kv_cache_spec, kv_cache_groups)
         return kv_cache_groups
+    def _group_target_specs(specs: dict[str, KVCacheSpec]) -> list[KVCacheGroupSpec]:
+        """Group target model specs using the original logic."""
+        if not specs:
+            return []
+        if is_kv_cache_spec_uniform(specs):
+            return _get_kv_cache_groups_uniform_spec(specs)
+        elif uniform_spec := UniformTypeKVCacheSpecs.from_specs(specs):
+            return _get_kv_cache_groups_uniform_type(uniform_spec)
+        # For hybrid models, try to unify page size then do the complex grouping
+        try:
+            unified = unify_kv_cache_spec_page_size(specs)
+            return _get_kv_cache_groups_uniform_page_size(unified)
+        except NotImplementedError:
+            # Fallback: group by spec type without unifying page size
+            # Group layers with identical spec into one group
+            same_type_layers: dict[KVCacheSpec, list[str]] = defaultdict(list)
+            for layer_name, layer_spec in specs.items():
+                same_type_layers[layer_spec].append(layer_name)
+            groups = []
+            for spec, layers in same_type_layers.items():
+                groups.append(KVCacheGroupSpec(layer_names=layers, kv_cache_spec=spec))
+            return groups
 
-    # As KVCacheManager can only allocate memory of one size, we need to unify
-    # the page size of the layers. For cases cannot be unified, this function
-    # will raise an error.
-    kv_cache_spec = unify_kv_cache_spec_page_size(kv_cache_spec)
-    # Model contains multiple attention types, but KV cache of all layers
-    # have the same physical memory per block per layer. Split the layers
-    # into groups with the same number of layers, and thus same total page
-    # size.
-    return _get_kv_cache_groups_uniform_page_size(kv_cache_spec)
+    def _group_draft_specs(specs: dict[str, KVCacheSpec]) -> list[KVCacheGroupSpec]:
+        """Group draft model specs (simpler, usually all FullAttention)."""
+        if not specs:
+            return []
+        if is_kv_cache_spec_uniform(specs):
+            return _get_kv_cache_groups_uniform_spec(specs)
+        elif uniform_spec := UniformTypeKVCacheSpecs.from_specs(specs):
+            return _get_kv_cache_groups_uniform_type(uniform_spec)
+        try:
+            unified = unify_kv_cache_spec_page_size(specs)
+            return _get_kv_cache_groups_uniform_page_size(unified)
+        except NotImplementedError:
+            logger.warning(
+                "Draft model KV cache page size unification failed. "
+                "Creating individual groups per layer."
+            )
+            return _get_kv_cache_groups_per_layer(specs)
+
+    target_groups = _group_target_specs(target_specs)
+    draft_groups = _group_draft_specs(draft_specs)
+
+    return target_groups + draft_groups
 
 
 def generate_scheduler_kv_cache_config(
@@ -1762,8 +2108,29 @@ def _max_memory_usage_bytes_from_groups(
             total_max_mem_usage_bytes += g_max_mem_usage_page_bytes
         return total_max_mem_usage_bytes
 
-    # General case: group_size pools, each shared by one layer per group
-    # Memory = group_size * page_size * blocks_for_max_len
+    # General case: check if all groups have uniform page size
+    all_page_sizes = set()
+    for group in kv_cache_groups:
+        spec = group.kv_cache_spec
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            for ls in spec.kv_cache_specs.values():
+                all_page_sizes.add(ls.page_size_bytes)
+        else:
+            all_page_sizes.add(spec.page_size_bytes)
+
+    if len(all_page_sizes) > 1:
+        # Non-uniform page sizes: sum memory per group independently
+        total = 0
+        for group in kv_cache_groups:
+            spec = group.kv_cache_spec
+            if isinstance(spec, UniformTypeKVCacheSpecs):
+                for ls in spec.kv_cache_specs.values():
+                    total += ls.max_memory_usage_bytes(vllm_config)
+            else:
+                total += spec.max_memory_usage_bytes(vllm_config)
+        return total
+
+    # Uniform page size: use the original shared-pool formula
     group_size = max(len(group.layer_names) for group in kv_cache_groups)
     page_size = get_uniform_page_size(
         [group.kv_cache_spec for group in kv_cache_groups]
@@ -2042,8 +2409,18 @@ def get_kv_cache_configs(
 
         # Shrink tensor size proportionally
         for tensor in kv_cache_config.kv_cache_tensors:
-            assert tensor.size % num_blocks_old == 0
-            tensor.size = tensor.size // num_blocks_old * min_num_blocks
+            old_size = tensor.size
+            if tensor.size % num_blocks_old == 0:
+                tensor.size = tensor.size // num_blocks_old * min_num_blocks
+            else:
+                # For non-uniform page sizes, tensor sizes may not be evenly
+                # divisible. Scale proportionally using round to avoid off-by-one.
+                tensor.size = round(tensor.size / num_blocks_old * min_num_blocks)
+            if old_size != tensor.size:
+                logger.info(
+                    "Shrinking tensor from %d to %d (num_blocks_old=%d, min_num_blocks=%d)",
+                    old_size, tensor.size, num_blocks_old, min_num_blocks,
+                )
 
         if len(kv_cache_config.kv_cache_groups) > 0:
             _report_kv_cache_config(vllm_config, kv_cache_config)
