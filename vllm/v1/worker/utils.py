@@ -115,8 +115,11 @@ class KVBlockZeroer:
         Only AttentionSpec layers are processed; Mamba layers are skipped.
         """
         seen_ptrs: set[int] = set()
-        seg_addrs: list[int] = []
-        page_size_el: int | None = None
+        # Support per-group page sizes (needed when draft model has different
+        # hidden size from target). Build independent address tables per group.
+        group_seg_addrs: dict[int, list[int]] = {}
+        group_page_size_el: dict[int, int | None] = {}
+        group_num_blocks: dict[int, int] = {}
 
         for group in attn_groups_iter:
             spec = group.kv_cache_spec
@@ -124,7 +127,8 @@ class KVBlockZeroer:
                 continue
             if group.kv_cache_group_id >= len(kernel_block_sizes):
                 continue
-            kernel_bs = kernel_block_sizes[group.kv_cache_group_id]
+            gid = group.kv_cache_group_id
+            kernel_bs = kernel_block_sizes[gid]
             ratio = spec.block_size // kernel_bs
             block_dim = group.backend.get_kv_cache_block_dim(
                 kernel_bs,
@@ -132,6 +136,18 @@ class KVBlockZeroer:
                 spec.head_size,
                 cache_dtype_str=cache_dtype,
             )
+            logger.debug(
+                "KVBlockZeroer group %d: layer_names=%s, block_size=%d, "
+                "kernel_bs=%d, ratio=%d, block_dim=%d, "
+                "num_kv_heads=%d, head_size=%d",
+                gid, group.layer_names, spec.block_size,
+                kernel_bs, ratio, block_dim,
+                spec.num_kv_heads, spec.head_size,
+            )
+
+            cur_addrs: list[int] = []
+            cur_page_size_el: int | None = None
+            cur_seen_ptrs: set[int] = set()
 
             for layer_name in group.layer_names:
                 if layer_name in runner_only_attn_layers:
@@ -140,20 +156,29 @@ class KVBlockZeroer:
                 if not isinstance(kv, torch.Tensor):
                     continue
                 dp = kv.data_ptr()
-                if dp in seen_ptrs:
+                if dp in cur_seen_ptrs:
                     continue
-                seen_ptrs.add(dp)
+                cur_seen_ptrs.add(dp)
 
                 el = kv.element_size()
                 cur_bytes = kv.stride(block_dim) * el
                 assert cur_bytes % 4 == 0
                 kernel_block_el = cur_bytes // 4
-                cur_page_el = kernel_block_el * ratio
-                if page_size_el is None:
-                    page_size_el = cur_page_el
+                cur_pse = kernel_block_el * ratio
+                logger.debug(
+                    "KVBlockZeroer layer %s: kv_shape=%s, kv_stride=%s, "
+                    "block_dim=%d, cur_bytes=%d, kernel_block_el=%d, "
+                    "cur_pse=%d, is_tensor=%s",
+                    layer_name, list(kv.shape), [kv.stride(d) for d in range(kv.ndim)],
+                    block_dim, cur_bytes, kernel_block_el,
+                    cur_pse, isinstance(kv, torch.Tensor),
+                )
+                if cur_page_size_el is None:
+                    cur_page_size_el = cur_pse
                 else:
-                    assert page_size_el == cur_page_el, (
-                        f"Non-uniform page sizes: {page_size_el} vs {cur_page_el}"
+                    assert cur_page_size_el == cur_pse, (
+                        f"Non-uniform page sizes within group {gid}: "
+                        f"{cur_page_size_el} vs {cur_pse}"
                     )
 
                 block_stride_bytes = cur_bytes
@@ -165,13 +190,37 @@ class KVBlockZeroer:
                 outer_strides = [kv.stride(d) * el for d in outer_dims]
                 for outer in iprod(*(range(kv.shape[d]) for d in outer_dims)):
                     off_bytes = sum(i * s for i, s in zip(outer, outer_strides))
-                    seg_addrs.append(dp + off_bytes)
+                    cur_addrs.append(dp + off_bytes)
 
-        if not seg_addrs or page_size_el is None:
-            self._meta = None
-            return
+            if cur_addrs:
+                group_seg_addrs.setdefault(gid, []).extend(cur_addrs)
+                group_page_size_el[gid] = cur_page_size_el
+                # Track num_blocks for this group from KV tensor shape
+                # block_dim is 0 (outermost), so shape[0] = num_blocks
+                # after virtual splitting: num_blocks * (block_size / kernel_bs)
+                if group.kv_cache_group_id < len(kernel_block_sizes):
+                    ratio = spec.block_size // kernel_block_sizes[group.kv_cache_group_id]
+                else:
+                    ratio = 1
+                group_num_blocks[gid] = kv.shape[0] // ratio if ratio > 0 else kv.shape[0]
 
-        blk_size = min(largest_power_of_2_divisor(page_size_el), 1024)
+        # Build per-group metadata
+        metas: dict[int, tuple[torch.Tensor, int, int, int, int]] = {}
+        for gid, seg_addrs in group_seg_addrs.items():
+            page_size_el = group_page_size_el.get(gid)
+            if not seg_addrs or page_size_el is None:
+                continue
+            blk_size = min(largest_power_of_2_divisor(page_size_el), 1024)
+            num_blocks = group_num_blocks.get(gid, 0)
+            metas[gid] = (
+                torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
+                page_size_el,
+                blk_size,
+                len(seg_addrs),
+                num_blocks,
+            )
+
+        self._metas = metas
         self._id_cap = 8192
         self._ids_pinned = torch.empty(
             self._id_cap,
@@ -179,18 +228,11 @@ class KVBlockZeroer:
             pin_memory=self.pin_memory,
         )
         self._ids_gpu = torch.empty(self._id_cap, dtype=torch.int64, device=self.device)
-        self._meta = (
-            torch.tensor(seg_addrs, dtype=torch.uint64, device=self.device),
-            page_size_el,
-            blk_size,
-            len(seg_addrs),
-        )
 
     def zero_block_ids(self, block_ids: list[int]) -> None:
         """Zero the KV cache memory for the given block IDs."""
-        if not block_ids or self._meta is None:
+        if not block_ids or not self._metas:
             return
-        seg_addrs, page_size_el, blk_size, n_segs = self._meta
         n_blocks = len(block_ids)
         if n_blocks > self._id_cap:
             self._id_cap = n_blocks * 2
@@ -206,15 +248,28 @@ class KVBlockZeroer:
         self._ids_pinned[:n_blocks].numpy()[:] = block_ids
         idx = self._ids_gpu[:n_blocks]
         idx.copy_(self._ids_pinned[:n_blocks], non_blocking=True)
-        grid = (n_blocks * n_segs * (page_size_el // blk_size),)
-        _zero_kv_blocks_kernel[grid](
-            seg_addrs,
-            idx,
-            n_blocks,
-            N_SEGS=n_segs,
-            PAGE_SIZE_EL=page_size_el,
-            BLOCK_SIZE=blk_size,
-        )
+        
+        # Zero blocks for each group independently (supports non-uniform page sizes)
+        # Filter block_ids per group to skip blocks beyond the group's allocation
+        for gid, meta in self._metas.items():
+            seg_addrs, page_size_el, blk_size, n_segs, num_blocks_in_group = meta
+            # Filter: only zero blocks within this group's allocation
+            valid_ids = [b for b in block_ids if b < num_blocks_in_group]
+            if not valid_ids:
+                continue
+            n_valid = len(valid_ids)
+            self._ids_pinned[:n_valid].numpy()[:] = valid_ids
+            valid_idx = self._ids_gpu[:n_valid]
+            valid_idx.copy_(self._ids_pinned[:n_valid], non_blocking=True)
+            grid = (n_valid * n_segs * (page_size_el // blk_size),)
+            _zero_kv_blocks_kernel[grid](
+                seg_addrs,
+                valid_idx,
+                n_valid,
+                N_SEGS=n_segs,
+                PAGE_SIZE_EL=page_size_el,
+                BLOCK_SIZE=blk_size,
+            )
 
 
 @dataclass
