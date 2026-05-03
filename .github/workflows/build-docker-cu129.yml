@@ -1,0 +1,151 @@
+# Build vLLM Docker image (CUDA 12.9) and push to GitHub Container Registry
+#
+# This workflow builds the `vllm-openai` target from docker/Dockerfile using
+# CUDA 12.9.1 and pushes the image to ghcr.io.
+#
+# Usage:
+#   - Manually trigger from Actions tab
+#   - On push to tags matching "v*" (e.g. v0.6.0, v0.6.1a1)
+#
+# Prerequisites:
+#   - A self-hosted GitHub Actions runner with GPU support (NVIDIA GPU + drivers)
+#     and Docker configured with NVIDIA Container Toolkit.
+#   - The runner must have access to pull nvidia/cuda base images from Docker Hub.
+#
+# The built image is tagged as:
+#   ghcr.io/<owner>/<repo>:<tag>-cu129    (on tag push)
+#   ghcr.io/<owner>/<repo>:main-cu129     (on main branch push)
+#   ghcr.io/<owner>/<repo>:<branch>-cu129 (on other branch push)
+
+name: Build & Push Docker Image (CUDA 12.9)
+
+on:
+  push:
+    tags:
+      - "v*"
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      cuda_version:
+        description: "CUDA version"
+        required: true
+        default: "12.9.1"
+      ubuntu_version:
+        description: "Ubuntu base version"
+        required: true
+        default: "22.04"
+      torch_cuda_arch_list:
+        description: "TORCH_CUDA_ARCH_LIST (SM architectures)"
+        required: false
+        default: "7.5 8.0 8.6 8.9 9.0 10.0 12.0"
+      max_jobs:
+        description: "Max parallel build jobs"
+        required: false
+        default: "16"
+      install_kv_connectors:
+        description: "Install KV connectors"
+        required: false
+        default: "false"
+
+env:
+  CUDA_VERSION: "12.9.1"
+  UBUNTU_VERSION: "22.04"
+  TORCH_CUDA_ARCH_LIST: "7.5 8.0 8.6 8.9 9.0 10.0 12.0"
+  MAX_JOBS: "16"
+  INSTALL_KV_CONNECTORS: "false"
+  # CUDA arch list for CU12.9 — following PyTorch RELEASE.md
+  # SM86 included for broader Ampere coverage; SM89 for marlin fp8 support
+  CUDA_ARCH_X86_CU129: "7.5 8.0 8.6 8.9 9.0 10.0 12.0"
+
+jobs:
+  determine-image-tag:
+    name: Determine Image Tag
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.set-tag.outputs.image_tag }}
+    steps:
+      - id: set-tag
+        run: |
+          if [[ -n "$GITHUB_REF_NAME" && "$GITHUB_REF_TYPE" == "tag" ]]; then
+            # Strip leading 'v' if present, e.g. v0.6.0 -> 0.6.0
+            VERSION="${GITHUB_REF_NAME#v}"
+            echo "image_tag=${VERSION}-cu129"
+          elif [[ "$GITHUB_REF_NAME" == "main" ]]; then
+            echo "image_tag=main-cu129"
+          else
+            # Sanitize branch name: replace '/' and '-' with allowed chars
+            BRANCH=$(echo "$GITHUB_REF_NAME" | sed 's/[^a-zA-Z0-9._-]/_/g')
+            echo "image_tag=${BRANCH}-cu129"
+          fi
+
+  build-and-push:
+    name: Build & Push (${{ matrix.arch }})
+    needs: determine-image-tag
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: gpu-runner  # Self-hosted runner label; adjust to your actual runner label
+            platforms: linux/amd64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history for version detection via setuptools_scm
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=${{ needs.determine-image-tag.outputs.image_tag }}
+            type=raw,value=${{ needs.determine-image-tag.outputs.image_tag }}-${{ matrix.arch }}
+
+      - name: Free disk space
+        run: |
+          # Remove unnecessary files to make room for the ~20GB+ Docker build
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /usr/share/swift
+          df -h
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: vllm-openai
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: ${{ matrix.platforms }}
+          build-args: |
+            CUDA_VERSION=${{ env.CUDA_VERSION }}
+            UBUNTU_VERSION=${{ env.UBUNTU_VERSION }}
+            BUILD_BASE_IMAGE=nvidia/cuda:${{ env.CUDA_VERSION }}-devel-ubuntu${{ env.UBUNTU_VERSION }}
+            FINAL_BASE_IMAGE=nvidia/cuda:${{ env.CUDA_VERSION }}-base-ubuntu${{ env.UBUNTU_VERSION }}
+            torch_cuda_arch_list=${{ env.CUDA_ARCH_X86_CU129 }}
+            max_jobs=${{ env.MAX_JOBS }}
+            INSTALL_KV_CONNECTORS=${{ env.INSTALL_KV_CONNECTORS }}
+            GIT_REPO_CHECK=1
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          # Docker build can take 2-4 hours on a single GPU machine
+          no-cache: false
