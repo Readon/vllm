@@ -493,7 +493,13 @@ class TritonAttentionImpl(AttentionImpl):
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
         self.attn_type = attn_type
-        self.fp8_dtype = current_platform.fp8_dtype()
+        # Select the correct fp8 dtype to match the KV cache format.
+        # fp8_e5m2 KV cache needs float8_e5m2 views; all other fp8 variants
+        # use the platform default (float8_e4m3fn).
+        if kv_cache_dtype == "fp8_e5m2":
+            self.fp8_dtype = torch.float8_e5m2
+        else:
+            self.fp8_dtype = current_platform.fp8_dtype()
 
         self.sinks = sinks
         if sinks is not None:

@@ -353,11 +353,14 @@ def triton_reshape_and_cache_flash(
     assert kv_cache_dtype == "auto" or is_quantized_kv_cache(kv_cache_dtype), (
         f"unsupported kv_cache_dtype (str), got {kv_cache_dtype}."
     )
-    kv_cache_torch_dtype = (
-        current_platform.fp8_dtype()
-        if is_quantized_kv_cache(kv_cache_dtype)
-        else key_cache.dtype
-    )
+    if is_quantized_kv_cache(kv_cache_dtype):
+        kv_cache_torch_dtype = (
+            torch.float8_e5m2
+            if kv_cache_dtype == "fp8_e5m2"
+            else current_platform.fp8_dtype()
+        )
+    else:
+        kv_cache_torch_dtype = key_cache.dtype
 
     if key_cache.dtype != kv_cache_torch_dtype and is_quantized_kv_cache(
         kv_cache_dtype
@@ -532,11 +535,14 @@ def triton_reshape_and_cache_flash_diffkv(
     assert kv_cache_dtype == "auto" or is_quantized_kv_cache(kv_cache_dtype), (
         f"unsupported kv_cache_dtype (str), got {kv_cache_dtype}."
     )
-    kv_cache_torch_dtype = (
-        current_platform.fp8_dtype()
-        if is_quantized_kv_cache(kv_cache_dtype)
-        else kv_cache.dtype
-    )
+    if is_quantized_kv_cache(kv_cache_dtype):
+        kv_cache_torch_dtype = (
+            torch.float8_e5m2
+            if kv_cache_dtype == "fp8_e5m2"
+            else current_platform.fp8_dtype()
+        )
+    else:
+        kv_cache_torch_dtype = kv_cache.dtype
 
     if kv_cache.dtype != kv_cache_torch_dtype and is_quantized_kv_cache(kv_cache_dtype):
         # to avoid erounous implicit cast in triton kernel (tl.store to uint8)
