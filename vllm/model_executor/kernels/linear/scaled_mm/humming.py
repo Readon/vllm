@@ -30,8 +30,8 @@ class HummingFP8ScaledMMLinearKernel(FP8ScaledMMLinearKernel):
         if not current_platform.is_cuda():
             return False, "Humming only supported on CUDA"
 
-        if not current_platform.has_device_capability(75):
-            return False, "Humming only supported on SM75+"
+        if not current_platform.has_device_capability(80):
+            return False, "Humming FP8 scaled-MM kernel requires SM80+ (NVRTC JIT uses MMA instructions)"
 
         return True, None
 

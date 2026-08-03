@@ -459,10 +459,20 @@ def prepare_humming_layer(
     # raise on layers lacking input_size (e.g. ParallelLMHead).
     if hasattr(layer, "input_size_per_partition"):
         input_size_per_partition = layer.input_size_per_partition
-    else:
+    elif hasattr(layer, "input_size"):
         input_size_per_partition = layer.input_size
+    else:
+        # ParallelLMHead etc. — not a LinearBase subclass
+        input_size_per_partition = layer.embedding_dim
     shape_k_stacks = [input_size_per_partition]
-    shape_n_stacks = layer.output_partition_sizes
+
+    if hasattr(layer, "output_partition_sizes"):
+        output_partition_sizes = layer.output_partition_sizes
+    else:
+        # ParallelLMHead — not a LinearBase subclass, no output_partition_sizes.
+        # The "output" dim is the vocab partition; compute from weight shape.
+        output_partition_sizes = [layer.num_embeddings_per_partition]
+    shape_n_stacks = output_partition_sizes
 
     # Step 1: convert weight and input schemas to humming standard format
     weight_schema, tensors = weight_schema.convert_humming(
@@ -492,13 +502,13 @@ def prepare_humming_layer(
     # Step 2: transform weight (humming standard format) for forwarding
     HummingMethod.prepare_layer_meta(
         layer=layer,
-        shape_n=sum(layer.output_partition_sizes),
+        shape_n=sum(output_partition_sizes),
         shape_k=input_size_per_partition,
         weight_schema=weight_schema,
         input_schema=input_schema,
         pad_n_to_multiple=256,
         pad_k_to_multiple=128,
-        has_bias=layer.has_bias,
+        has_bias=getattr(layer, "has_bias", False),
         torch_dtype=layer.params_dtype,
     )
 

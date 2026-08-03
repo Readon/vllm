@@ -70,6 +70,11 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
         layer.input_size_per_partition = input_size_per_partition
         layer.output_size_per_partition = output_size_per_partition
         layer.orig_dtype = params_dtype
+        # Set for kernels' weight prep; also covers ParallelLMHead, which does
+        # not set these in __init__.
+        layer.output_partition_sizes = output_partition_sizes
+        if not hasattr(layer, "has_bias"):
+            layer.has_bias = False
         layer.weight_block_size = None
 
         if self.strategy == QuantizationStrategy.BLOCK:
