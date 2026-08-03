@@ -1708,7 +1708,13 @@ class FlashInferImpl(AttentionImpl):
         if self.bmm1_scale is None:
             self.bmm1_scale = self.scale
             if is_quantized_kv_cache(self.kv_cache_dtype):
-                self.bmm1_scale *= layer._q_scale_float * layer._k_scale_float
+                # The QK^T scale only includes the Q scale when the query is
+                # itself quantized to FP8; a plain FP16/BF16 query is not
+                # scaled (multiplying q_scale into a non-quantized query
+                # shrinks all logits and destroys the output).
+                if query.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                    self.bmm1_scale *= layer._q_scale_float
+                self.bmm1_scale *= layer._k_scale_float
 
         if self.bmm2_scale is None:
             self.bmm2_scale = 1.0
@@ -1925,7 +1931,11 @@ class FlashInferImpl(AttentionImpl):
                     prefill_wrapper.run(
                         prefill_query,
                         kv_cache_for_fi,
-                        q_scale=layer._q_scale_float,
+                        q_scale=(
+                            layer._q_scale_float
+                            if attn_metadata.q_data_type_prefill == FP8_DTYPE
+                            else None
+                        ),
                         k_scale=layer._k_scale_float,
                         v_scale=layer._v_scale_float,
                         out=out_prefill,
@@ -2091,7 +2101,11 @@ class FlashInferImpl(AttentionImpl):
                     decode_wrapper.run(
                         decode_query,
                         kv_cache_for_fi,
-                        q_scale=layer._q_scale_float,
+                        q_scale=(
+                            layer._q_scale_float
+                            if attn_metadata.q_data_type_decode == FP8_DTYPE
+                            else None
+                        ),
                         k_scale=layer._k_scale_float,
                         v_scale=layer._v_scale_float,
                         out=output_tmp,
@@ -2108,7 +2122,11 @@ class FlashInferImpl(AttentionImpl):
                     decode_wrapper.run(
                         decode_query,
                         kv_cache_for_fi,
-                        q_scale=layer._q_scale_float,
+                        q_scale=(
+                            layer._q_scale_float
+                            if attn_metadata.q_data_type_decode == FP8_DTYPE
+                            else None
+                        ),
                         k_scale=layer._k_scale_float,
                         v_scale=layer._v_scale_float,
                         out=out_decode,
