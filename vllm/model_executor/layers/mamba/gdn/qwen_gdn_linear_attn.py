@@ -84,7 +84,7 @@ logger = init_logger(__name__)
 
 def _resolve_gdn_prefill_backend(
     vllm_config: VllmConfig,
-) -> tuple[str, Literal["triton", "flashinfer", "cutedsl"]]:
+) -> tuple[str, Literal["triton", "flashinfer", "cutedsl", "flashqla_legacy"]]:
     """Resolve GDN prefill backend.
 
     FlashInfer's GDN prefill kernel is chosen when:
@@ -93,6 +93,11 @@ def _resolve_gdn_prefill_backend(
     * one of the following:
       - Hopper (SM90) — no further constraints;
       - Blackwell (SM10.x) with ``head_k_dim == 128``, ``cuda_runtime >= 13``.
+
+    FlashQLA legacy GDN prefill kernel is chosen when:
+    * ``requested in ["flashinfer", "flashqla_legacy", "auto"]``;
+    * ``platform == cuda``;
+    * SM70 or SM75 (Turing/Volta) — no further constraints;
 
     In-tree CuteDSL GDN prefill kernel is chosen when:
     * "cutedsl" is requested; (opt-in only)
@@ -115,6 +120,7 @@ def _resolve_gdn_prefill_backend(
 
     supports_flashinfer = False
     supports_cutedsl = False
+    supports_flashqla_legacy = False
 
     if current_platform.is_device_capability(90):
         supports_flashinfer = True
@@ -125,13 +131,16 @@ def _resolve_gdn_prefill_backend(
     ):
         supports_flashinfer = True
         supports_cutedsl = True
+    elif current_platform.is_device_capability((7, 0)) or current_platform.is_device_capability((7, 5)):
+        supports_flashqla_legacy = True
 
     if backend in ["flashinfer", "auto"] and supports_flashinfer:
         return backend, "flashinfer"
+    if backend in ["flashinfer", "flashqla_legacy", "auto"] and supports_flashqla_legacy:
+        return backend, "flashqla_legacy"
     if backend == "cutedsl" and supports_cutedsl:
         return backend, "cutedsl"
     return backend, "triton"
-
 
 def _log_gdn_backend_decision(
     vllm_config: VllmConfig,
@@ -146,6 +155,7 @@ def _log_gdn_backend_decision(
         "flashinfer": "FlashInfer",
         "cutedsl": "CuteDSL",
         "triton": "Triton/FLA",
+        "flashqla_legacy": "FlashQLA Legacy",
     }[active_backend]
     logger.info_once(
         "Using %s GDN prefill kernel (requested=%s, head_k_dim=%s).",
@@ -209,6 +219,44 @@ def fi_chunk_gated_delta_rule(
         return result.unsqueeze(0), None
 
 
+def flashqla_legacy_chunk_gated_delta_rule(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor,
+    output_final_state: bool,
+    use_qk_l2norm_in_kernel: bool = True,
+):
+    from flash_qla.ops.gated_delta_rule.legacy import (
+        chunk_gated_delta_rule_fwd_legacy,
+    )
+
+    if use_qk_l2norm_in_kernel:
+        q = l2norm_fwd(q)
+        k = l2norm_fwd(k)
+
+    output_dtype = v.dtype
+    state_dtype = initial_state.dtype
+    scale = q.shape[-1] ** -0.5
+    output, final_state = chunk_gated_delta_rule_fwd_legacy(
+        q.to(torch.float32).contiguous(),
+        k.to(torch.float32).contiguous(),
+        v.to(torch.float32).contiguous(),
+        g.to(torch.float32).contiguous(),
+        beta.to(torch.float32).contiguous(),
+        scale,
+        initial_state.to(torch.float32).contiguous(),
+    )
+    output = output.to(output_dtype)
+    if output_final_state:
+        final_state = final_state.to(state_dtype)
+    else:
+        final_state = None
+    return output, final_state
+
+
 @CustomOp.register("chunk_gated_delta_rule")
 class ChunkGatedDeltaRule(CustomOp):
     def __init__(self) -> None:
@@ -217,7 +265,7 @@ class ChunkGatedDeltaRule(CustomOp):
         backend, active_backend = _resolve_gdn_prefill_backend(vllm_config)
         self.gdn_prefill_backend = active_backend
 
-        if backend in ("flashinfer", "cutedsl") and active_backend != backend:
+        if backend in ("flashinfer", "cutedsl", "flashqla_legacy") and active_backend != backend:
             logger.warning_once(
                 "GDN prefill backend '%s' is selected but cannot use this "
                 "kernel on the current platform. Falling back to Triton/FLA.",
@@ -229,8 +277,11 @@ class ChunkGatedDeltaRule(CustomOp):
             self._forward_method = self.forward_cuda
         elif active_backend == "cutedsl":
             self._forward_method = self.forward_cutedsl
+        elif active_backend == "flashqla_legacy":
+            self._forward_method = self.forward_flashqla_legacy
         else:
             self._forward_method = self.forward_native
+
 
     def forward_cuda(
         self,
@@ -336,6 +387,65 @@ class ChunkGatedDeltaRule(CustomOp):
         if not output_final_state:
             final_state = None
         return o, final_state
+
+    def forward_flashqla_legacy(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        initial_state: torch.Tensor,
+        output_final_state: bool,
+        cu_seqlens: torch.Tensor | None = None,
+        chunk_indices: torch.Tensor | None = None,
+        chunk_offsets: torch.Tensor | None = None,
+        use_qk_l2norm_in_kernel: bool = True,
+        core_attn_out: torch.Tensor | None = None,
+    ):
+        # FlashQLA legacy is a forward-only, single-contiguous-sequence kernel.
+        # Fall back to Triton/FLA for varlen/chunk-indexed cases.
+        if (
+            q.ndim == 4
+            and k.ndim == 4
+            and v.ndim == 4
+            and q.shape[0] == 1
+            and (cu_seqlens is None or int(cu_seqlens.numel()) == 2)
+        ):
+            output, final_state = flashqla_legacy_chunk_gated_delta_rule(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=initial_state,
+                output_final_state=output_final_state,
+                use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            )
+            if core_attn_out is not None:
+                out_flat = output.squeeze(0).reshape(-1)
+                co_flat = core_attn_out.reshape(-1)
+                co_flat[: out_flat.numel()].copy_(out_flat)
+            return output, final_state
+
+        logger.warning_once(
+            "FlashQLA legacy GDN prefill received unsupported varlen/chunked "
+            "metadata; falling back to Triton/FLA for this call."
+        )
+        return self.forward_native(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            core_attn_out=core_attn_out,
+        )
 
 
 @PluggableLayer.register("qwen_gated_delta_net_attention")
