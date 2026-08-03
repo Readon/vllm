@@ -459,12 +459,11 @@ class FlashInferBackend(AttentionBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        # FlashInfer supports SM75+, but is currently broken on SM75 (Turing):
-        # https://github.com/flashinfer-ai/flashinfer/issues/3620 (fix:
-        # https://github.com/flashinfer-ai/flashinfer/pull/3621). Temporarily
-        # raise the floor to SM80 so it is not auto-selected on SM75 until
-        # that fix lands; revert to DeviceCapability(7, 5) once it does.
-        return capability >= DeviceCapability(8, 0) and capability <= DeviceCapability(
+        # FlashInfer supports SM75+. The prefill shared-memory issue on
+        # small-smem GPUs (SM75/Turing, #3620) was fixed in flashinfer
+        # commit 35544c36 ("Fix prefill shared-memory budget so kernels
+        # launch on small-smem GPUs", landed 2026-06-12).
+        return capability >= DeviceCapability(7, 5) and capability <= DeviceCapability(
             12, 1
         )
 
@@ -904,7 +903,16 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         if current_platform.is_device_capability(90):
             return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
 
-        # For UniformTypeKVCacheSpecs, check all contained specs
+        # SM75 (Turing): FlashInfer paged decode handles uniform batch
+        # sizes; MTP spec-decode produces uniform query_len=1+MTP_K.
+        # UNIFORM_BATCH enables FULL CUDA graph decode, critical for TG
+        # throughput on Turing.
+        if current_platform.is_device_capability(75):
+            return AttentionCGSupport.UNIFORM_BATCH
+
+        # Other architectures: keep the trtllm head-config check so FULL
+        # decode graphs are only advertised when the head counts are
+        # supported by the trtllm decode path.
         kv_specs = (
             kv_cache_spec.kv_cache_specs.values()
             if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs)
