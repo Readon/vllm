@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """High-Performance Triton-only Attention layer."""
 
+import os
+
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -49,6 +51,15 @@ from vllm.v1.kv_cache_interface import (
 )
 
 logger = init_logger(__name__)
+
+# SM75 prefill dispatch: route long-context prefill to PyTorch SDPA
+# on Turing GPUs (SM75) where TRITON_ATTN's unified prefill is slower.
+# Disabled by default; set VLLM_GEMMA4_SM75_FI_PREFILL256=1 to enable.
+# Reads raw K/V tensors (not the paged KV cache), so no layout change needed.
+_GEMMA4_SM75_FI_PREFILL256 = os.getenv(
+    "VLLM_GEMMA4_SM75_FI_PREFILL256", "0"
+) == "1"
+_GEMMA4_SM75_FI_PREFILL256_USED = 0
 
 
 # constants
@@ -577,6 +588,80 @@ class TritonAttentionImpl(AttentionImpl):
         else:
             self.use_td = td_override
 
+
+    def _try_sm75_sdpa_prefill256(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata,
+        output_scale: torch.Tensor | None,
+        output_block_scale: torch.Tensor | None,
+        num_actual_tokens: int,
+    ) -> bool:
+        """Route prefill to PyTorch SDPA on SM75 for head_size >= 256.
+
+        Returns True if the request was handled (prefill dispatched to SDPA).
+        Returns False to fall through to the normal unified_attention path.
+        Only works for pure prefill batches (no decode tokens, single seq).
+        """
+        global _GEMMA4_SM75_FI_PREFILL256_USED
+
+        if not _GEMMA4_SM75_FI_PREFILL256:
+            return False
+        if (
+            output_block_scale is not None
+            or output_scale is not None
+            or attn_metadata.use_cascade
+            or self.attn_type != AttentionType.DECODER
+            or self.head_size < 256
+            or self.sliding_window[0] >= 0
+            or self.logits_soft_cap != 0
+            or self.sinks is not None
+            or attn_metadata.max_query_len <= 1
+            or attn_metadata.max_query_len != attn_metadata.max_seq_len
+            or int(attn_metadata.seq_lens.shape[0]) != 1
+            or num_actual_tokens != query.shape[0]
+            or key.shape[0] != query.shape[0]
+            or value.shape[0] != query.shape[0]
+        ):
+            return False
+        if current_platform.get_device_capability() != (7, 5):
+            return False
+
+        q = query[:num_actual_tokens].transpose(0, 1).unsqueeze(0).contiguous()
+        k = key[:num_actual_tokens].transpose(0, 1).unsqueeze(0).contiguous()
+        v = value[:num_actual_tokens].transpose(0, 1).unsqueeze(0).contiguous()
+
+        # Handle GQA: repeat K/V heads to match query heads
+        if q.shape[1] != k.shape[1]:
+            repeat = q.shape[1] // k.shape[1]
+            k = k[:, :, None].expand(-1, -1, repeat, -1, -1).reshape(
+                1, q.shape[1], -1, self.head_size
+            )
+            v = v[:, :, None].expand(-1, -1, repeat, -1, -1).reshape(
+                1, q.shape[1], -1, self.head_size
+            )
+
+        import torch.nn.functional as F
+
+        attn_out = F.scaled_dot_product_attention(
+            q, k, v, is_causal=True, scale=self.scale,
+        )
+        output[:num_actual_tokens].copy_(attn_out.squeeze(0).transpose(0, 1))
+
+        _GEMMA4_SM75_FI_PREFILL256_USED += 1
+        if _GEMMA4_SM75_FI_PREFILL256_USED <= 4:
+            logger.info(
+                "Gemma4 SM75 SDPA prefill256 used count=%d "
+                "tokens=%d heads=%d head_dim=%d",
+                _GEMMA4_SM75_FI_PREFILL256_USED,
+                num_actual_tokens, query.shape[1], self.head_size,
+            )
+        return True
+
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -636,6 +721,15 @@ class TritonAttentionImpl(AttentionImpl):
                 attn_metadata,
                 layer,
             )
+
+        # SM75 prefill dispatch: route pure prefill to PyTorch SDPA
+        # for head_size >= 256 on Turing GPUs. Disabled by default.
+        if self._try_sm75_sdpa_prefill256(
+            query, key, value, output,
+            attn_metadata, output_scale,
+            output_block_scale, num_actual_tokens,
+        ):
+            return output
 
         # KV cache arrives in logical (B, H, N, 2*hs) order.
         # Per-token-head quantized KV cache: handled by the core unified
@@ -874,3 +968,4 @@ class TritonAttentionImpl(AttentionImpl):
             flash_layout,
             is_fp8_kv_cache,
         )
+
