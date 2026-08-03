@@ -239,12 +239,19 @@ def postprocess_mamba_fused_kernel(
 
     needs_copy = aligned_new_computed >= num_tokens_running_state
 
-    if not needs_copy:
-        return
-
-    # Compute copy parameters
-    accept_token_bias = aligned_new_computed - num_tokens_running_state
-    dest_block_idx = aligned_new_computed // block_size - 1
+    if needs_copy:
+        # Block-aligned (or nearly so): persist the running state at the
+        # aligned boundary block so a later cache hit finds it there.
+        accept_token_bias = aligned_new_computed - num_tokens_running_state
+        dest_block_idx = aligned_new_computed // block_size - 1
+    else:
+        # Non-block-aligned tail: the running state must still be persisted
+        # to the ACTUAL tail block (new_num_computed-1)//block_size. Without
+        # this, the state stays only in the speculative window blocks, and a
+        # later prefix-cache hit / block reuse reads stale (recycled) state
+        # for the tail -> corrupted decode output.
+        accept_token_bias = num_accepted - 1
+        dest_block_idx = (new_num_computed - 1) // block_size
 
     # Update accepted-token count before early exits (per-request, so only
     # state_idx == 0 writes). V2 updates in place; V1 writes the _out buffer.

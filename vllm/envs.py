@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     VLLM_LOG_STATS_INTERVAL: float = 10.0
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
+    VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH: bool = False
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
@@ -842,6 +843,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         bool(int(os.environ["VLLM_USE_FLASHINFER_SAMPLER"]))
         if "VLLM_USE_FLASHINFER_SAMPLER" in os.environ
         else True
+    ),
+    # Allow hybrid Mamba/GDN speculative decode to keep full decode CUDA
+    # graphs. Unsafe for production: accepted speculative lengths change
+    # recurrent-state update patterns, which full-graph capture fixes to a
+    # single topology. Opt-in peak-throughput experiments only.
+    "VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH": lambda: bool(
+        int(os.getenv("VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH", "0"))
     ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),

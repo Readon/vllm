@@ -1442,6 +1442,41 @@ class CompilationConfig:
                 cudagraph_mode = CUDAGraphMode.NONE
             logger.warning(msg)
 
+        # Hybrid Mamba/GDN models update recurrent state from the speculative
+        # acceptance metadata during decode. Keep speculative decode out of
+        # full-graph replay for these models: replaying the whole model
+        # forward reuses graph-captured recurrent-state update topology across
+        # changing acceptance patterns (each step accepts 0..K draft tokens),
+        # corrupting linear-attention state. PIECEWISE keeps the stateful
+        # attention kernels outside the full model graph while preserving
+        # compiled fast paths. Opt out via VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH
+        # for peak-throughput experiments only (output stability not
+        # guaranteed).
+        allow_mamba_spec_full_cudagraph = (
+            uniform_decode_query_len > 1
+            and kv_cache_config is not None
+            and kv_cache_config.has_mamba_layers
+            and envs.VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH
+        )
+        if (
+            cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+            and not allow_mamba_spec_full_cudagraph
+            and uniform_decode_query_len > 1
+            and kv_cache_config is not None
+            and kv_cache_config.has_mamba_layers
+        ):
+            msg = (
+                f"CUDAGraphMode.{cudagraph_mode.name} is not supported with "
+                "spec-decode for Mamba/GDN KV cache layers"
+            )
+            if cudagraph_mode.has_piecewise_cudagraphs():
+                msg += "; setting cudagraph_mode=PIECEWISE"
+                cudagraph_mode = CUDAGraphMode.PIECEWISE
+            else:
+                msg += "; setting cudagraph_mode=NONE"
+                cudagraph_mode = CUDAGraphMode.NONE
+            logger.warning(msg)
+
         # double check that we can support full cudagraph if they are requested
         # even after automatic downgrades
         if (
