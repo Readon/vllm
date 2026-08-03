@@ -320,6 +320,27 @@ class Attention(nn.Module, AttentionLayerBase):
                 sliding_window,
             )
 
+        # FP8 KV cache without a checkpoint kv_cache_scheme has no per-layer
+        # scales to load, and the scale defaults to 1.0 — quantizing K/V with
+        # scale=1.0 destroys precision (fp8 e4m3 values land in the low
+        # quantization bins), which degrades generation quality.  Fall back to
+        # dynamic scale calculation (max|K|/range on first forward) whenever
+        # fp8 KV was explicitly requested but the checkpoint provides no
+        # scales.  User-set calculate_kv_scales (True/False) still wins.
+        if (
+            calculate_kv_scales is False
+            and kv_cache_scheme is None
+            and isinstance(kv_cache_dtype, str)
+            and kv_cache_dtype.startswith("fp8")
+        ):
+            calculate_kv_scales = True
+            if cache_config is not None:
+                cache_config.calculate_kv_scales = True
+            logger.info(
+                "FP8 KV cache requested but the model checkpoint provides no "
+                "kv_cache_scheme scales; enabling dynamic kv scale calculation."
+            )
+
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             kv_cache_dtype, vllm_config.model_config
         )
@@ -582,6 +603,14 @@ class Attention(nn.Module, AttentionLayerBase):
         return output.view(-1, hidden_size)
 
     def calc_kv_scales(self, query, key, value):
+        # Skip scale calculation while a CUDA graph is being captured (GPU
+        # ops inside capture invalidate it) and on profile/dummy runs
+        # (zero-filled inputs would pin the scales to 0).  Keep the flag set
+        # so the first *real* eager forward computes the scales.
+        if torch.cuda.is_current_stream_capturing():
+            return
+        if query.numel() == 0 or torch.abs(query).max() == 0:
+            return
         self._q_scale.copy_(torch.abs(query).max() / self.q_range)
         self._k_scale.copy_(torch.abs(key).max() / self.k_range)
         self._v_scale.copy_(torch.abs(value).max() / self.v_range)
@@ -590,6 +619,12 @@ class Attention(nn.Module, AttentionLayerBase):
         self._v_scale_float = self._v_scale.item()
         self._k_scale_cpu.fill_(self._k_scale_float)
         self._v_scale_cpu.fill_(self._v_scale_float)
+        # The attention impl caches bmm1/bmm2 scales on its first forward
+        # (which may have happened during a dummy run with scale=1.0);
+        # invalidate the cache so it picks up the freshly computed scales.
+        for attr in ("bmm1_scale", "bmm2_scale"):
+            if hasattr(self.impl, attr):
+                setattr(self.impl, attr, None)
         # We only calculate the scales once
         self.calculate_kv_scales = False
 

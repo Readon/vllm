@@ -414,11 +414,42 @@ class HybridAttentionMambaModelConfig(VerifyAndUpdateConfig):
         """
         cache_config = vllm_config.cache_config
 
+        # FP8 KV cache without a checkpoint kv_cache_scheme has no scales to
+        # load; the attention layers fall back to dynamic scale calculation
+        # (which skips dummy/calibration forwards and computes max|K|/range on
+        # the first real prefill).  Enable it here so the model runner also
+        # sees it and keeps CUDA-graph capture off until the scales exist.
+        from vllm.model_executor.model_loader.weight_utils import get_quant_config
+
+        cache_dtype = cache_config.cache_dtype
+        try:
+            quant_config = get_quant_config(
+                vllm_config.model_config, vllm_config.load_config
+            )
+        except Exception:
+            quant_config = None
+        kv_cache_scheme = getattr(quant_config, "kv_cache_scheme", None)
+        fp8_kv_no_scheme = (
+            isinstance(cache_dtype, str)
+            and cache_dtype.startswith("fp8")
+            and kv_cache_scheme is None
+        )
+        if fp8_kv_no_scheme and not cache_config.calculate_kv_scales:
+            cache_config.calculate_kv_scales = True
+            logger.info(
+                "FP8 KV cache with no checkpoint kv_cache_scheme: enabling "
+                "dynamic KV scale calculation (hybrid models compute scales "
+                "on the first real prefill, skipping dummy/calibration runs)."
+            )
+
         # Disable calculate_kv_scales for hybrid models: uninitialized
         # recurrent state corrupts scales during the calibration pass.
         # See issue: https://github.com/vllm-project/vllm/issues/37554
+        # (skipped for fp8 KV caches without checkpoint scales: dynamic scale
+        #  calculation there is the only correct option, and the attention
+        #  layers guard against dummy/calibration forwards.)
 
-        if cache_config.calculate_kv_scales:
+        if cache_config.calculate_kv_scales and not fp8_kv_no_scheme:
             logger.warning(
                 "Disabling calculate_kv_scales for hybrid model '%s'. "
                 "Hybrid models with recurrent layers (GDN, Mamba, SSM) "

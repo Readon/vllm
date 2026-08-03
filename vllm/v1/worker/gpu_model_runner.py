@@ -5701,7 +5701,14 @@ class GPUModelRunner(
         """
 
         dp_size = self.vllm_config.parallel_config.data_parallel_size
-        randomize_inputs = envs.VLLM_RANDOMIZE_DP_DUMMY_INPUTS and dp_size > 1
+        # Randomize dummy inputs when KV scales are calculated dynamically:
+        # zero-filled dummy inputs would pin the per-tensor KV scales to 0
+        # (or keep them at the 1.0 default), which corrupts fp8 KV.  Random
+        # token ids give non-zero K/V so the first (dummy) forward computes
+        # meaningful scales before CUDA-graph capture.
+        randomize_inputs = (
+            envs.VLLM_RANDOMIZE_DP_DUMMY_INPUTS and dp_size > 1
+        ) or self.calculate_kv_scales
         if not randomize_inputs:
             yield
         elif input_ids is not None:
