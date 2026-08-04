@@ -739,7 +739,19 @@ class Scheduler(SchedulerInterface):
                         # already cached on D-side. The Mamba state (always
                         # the last block) is transferred unconditionally by
                         # _apply_prefix_caching in nixl/worker.py.
-                        num_new_local_computed_tokens = max(per_group_hits)
+                        # KV offloading (LMCache connector) frees GPU blocks
+                        # at request end, so a local hash hit on the next
+                        # request references freed blocks -> stale decode
+                        # (observed corrupting output with MTP enabled).
+                        # (A cleaner fix -- evicting the freed blocks' hashes
+                        # on offload -- does not work because the prefix
+                        # cache moves request-block hashes onto private
+                        # copy blocks, so the freed blocks carry no hashes.)
+                        # Disable local hits with a connector so the
+                        # connector reloads the full matched prefix from L1.
+                        num_new_local_computed_tokens = (
+                            0 if self.connector is not None else max(per_group_hits)
+                        )
                         # The per-group lookup does not detect an uncached shared
                         # prefix, so there is no junction to pin in this path.
                         request.shared_prefix_boundary = 0
